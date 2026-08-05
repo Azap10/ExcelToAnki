@@ -3,3 +3,6 @@ openpyxl
 pyautogui
 pyperclip
 anki
+pymupdf
+paddlepaddle>=3.0
+paddleocr

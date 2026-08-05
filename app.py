@@ -35,10 +35,26 @@ class ExcelToAnkiApp:
         self.root.after(100, self._process_events)
 
     def _build_interface(self) -> None:
-        container = ttk.Frame(self.root, padding=16)
-        container.grid(sticky="nsew")
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
+        style = ttk.Style(self.root)
+        style.configure("TNotebook.Tab", padding=(12, 5))
+
+        notebook = ttk.Notebook(self.root)
+        notebook.grid(column=0, row=0, sticky="nsew", padx=10, pady=10)
+
+        cards_tab = ttk.Frame(notebook, padding=16)
+        pdf_tab = ttk.Frame(notebook, padding=16)
+        settings_tab = ttk.Frame(notebook, padding=16)
+        notebook.add(cards_tab, text="Cards")
+        notebook.add(pdf_tab, text="PDF & OCR")
+        notebook.add(settings_tab, text="Settings")
+
+        self._build_cards_tab(cards_tab)
+        self._build_pdf_ocr_tab(pdf_tab)
+        self._build_settings_tab(settings_tab)
+
+    def _build_cards_tab(self, container: ttk.Frame) -> None:
         container.columnconfigure(1, weight=1)
         container.rowconfigure(5, weight=1)
 
@@ -90,6 +106,40 @@ class ExcelToAnkiApp:
         self.add_button.grid(column=1, row=0, sticky="e")
 
         ttk.Label(container, textvariable=self.status, foreground="#245a36").grid(column=0, row=7, columnspan=3, sticky="w", pady=(6, 0))
+
+    def _build_pdf_ocr_tab(self, container: ttk.Frame) -> None:
+        container.columnconfigure(0, weight=1)
+        ttk.Label(container, text="PDF & OCR", font=("Segoe UI", 18, "bold")).grid(column=0, row=0, sticky="w")
+        ttk.Label(
+            container,
+            text="Open bilingual PDFs, inspect pages, and recognize printed Chinese and English text.",
+        ).grid(column=0, row=1, sticky="w", pady=(2, 16))
+
+        recognition = ttk.LabelFrame(container, text="Recognition workflow", padding=12)
+        recognition.grid(column=0, row=2, sticky="ew")
+        ttk.Label(
+            recognition,
+            text="PDF viewing and page-by-page PaddleOCR recognition will be added here next. "
+            "The original PDF will remain unchanged during recognition.",
+            wraplength=720,
+            justify="left",
+        ).grid(column=0, row=0, sticky="w")
+
+    def _build_settings_tab(self, container: ttk.Frame) -> None:
+        container.columnconfigure(0, weight=1)
+        ttk.Label(container, text="Settings", font=("Segoe UI", 18, "bold")).grid(column=0, row=0, sticky="w")
+        ttk.Label(container, text="Application and integration settings.").grid(column=0, row=1, sticky="w", pady=(2, 16))
+
+        anki_settings = ttk.LabelFrame(container, text="Anki integration", padding=12)
+        anki_settings.grid(column=0, row=2, sticky="ew")
+        anki_settings.columnconfigure(0, weight=1)
+        ttk.Label(
+            anki_settings,
+            text="Refresh the available Anki decks after fully closing Anki and waiting for any media sync to finish.",
+            wraplength=720,
+            justify="left",
+        ).grid(column=0, row=0, sticky="w")
+        ttk.Button(anki_settings, text="Refresh Anki decks", command=self.refresh_decks).grid(column=1, row=0, sticky="e", padx=(12, 0))
 
     def choose_file(self) -> None:
         selected = filedialog.askopenfilename(title="Choose vocabulary workbook", filetypes=[("Excel workbooks", "*.xlsx *.xls"), ("All files", "*.*")])
