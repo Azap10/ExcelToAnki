@@ -11,8 +11,10 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from ankiHelpers import add_three_sided_card, list_decks
-from ocrHelpers import create_ocr_engine, open_pdf, process_pdf_page, process_pdf_region
-from PIL import Image
+from dictionaryHelpers import DictionaryEntry, format_definition, lookup
+# OCR/PDF integration is temporarily disabled on this fast-build branch.
+# from ocrHelpers import create_ocr_engine, open_pdf, process_pdf_page, process_pdf_region
+# from PIL import Image
 
 REQUIRED_COLUMNS = ("Chinese", "Pinyin", "English", "Lesson", "Character")
 PDF_RENDER_OVERSAMPLE = 2
@@ -44,6 +46,8 @@ class ExcelToAnkiApp:
         self.pending_entry_text = ""
         self.lesson_values: dict[str, object] = {}
         self.card_type_values: dict[str, object] = {}
+        self.dictionary_entries: tuple[DictionaryEntry, ...] = ()
+        self.manual_card_number = 0
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
 
         self.file_path = tk.StringVar()
@@ -54,6 +58,11 @@ class ExcelToAnkiApp:
         self.pdf_page_label = tk.StringVar(value="Page - of -")
         self.ocr_summary = tk.StringVar(value="Open a PDF, then recognize the current page.")
         self.entry_summary = tk.StringVar(value="Select Create Entry, then draw a box around text on the page.")
+        self.dictionary_query = tk.StringVar()
+        self.dictionary_summary = tk.StringVar(value="Enter a Chinese word or character to search CC-CEDICT.")
+        self.dictionary_character_set = tk.StringVar(value="simplified")
+        self.draft_chinese = tk.StringVar()
+        self.draft_pinyin = tk.StringVar()
         self.status = tk.StringVar(value="Choose an Excel workbook to begin.")
 
         self._build_interface()
@@ -72,13 +81,16 @@ class ExcelToAnkiApp:
 
         cards_tab = ttk.Frame(notebook, padding=16)
         pdf_tab = ttk.Frame(notebook, padding=16)
+        dictionary_tab = ttk.Frame(notebook, padding=16)
         settings_tab = ttk.Frame(notebook, padding=16)
         notebook.add(cards_tab, text="Cards")
         notebook.add(pdf_tab, text="PDF & OCR")
+        notebook.add(dictionary_tab, text="Dictionary")
         notebook.add(settings_tab, text="Settings")
 
         self._build_cards_tab(cards_tab)
         self._build_pdf_ocr_tab(pdf_tab)
+        self._build_dictionary_tab(dictionary_tab)
         self._build_settings_tab(settings_tab)
 
     def _build_cards_tab(self, container: ttk.Frame) -> None:
@@ -134,7 +146,237 @@ class ExcelToAnkiApp:
 
         ttk.Label(container, textvariable=self.status, foreground="#245a36").grid(column=0, row=7, columnspan=3, sticky="w", pady=(6, 0))
 
+    def _build_dictionary_tab(self, container: ttk.Frame) -> None:
+        """Build the manual dictionary-lookup and card-queue workflow."""
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(2, weight=1)
+        container.rowconfigure(3, weight=1)
+
+        ttk.Label(container, text="CC-CEDICT Dictionary", font=("Segoe UI", 18, "bold")).grid(column=0, row=0, sticky="w")
+        ttk.Label(
+            container,
+            text="Search a word or character, then highlight the meaning you want to use in a flashcard.",
+        ).grid(column=0, row=1, sticky="w", pady=(2, 14))
+
+        lookup_frame = ttk.LabelFrame(container, text="Look up a word", padding=10)
+        lookup_frame.grid(column=0, row=2, sticky="new")
+        lookup_frame.columnconfigure(1, weight=1)
+        ttk.Label(lookup_frame, text="Word or character").grid(column=0, row=0, sticky="w")
+        self.dictionary_query_entry = ttk.Entry(lookup_frame, textvariable=self.dictionary_query)
+        self.dictionary_query_entry.grid(column=1, row=0, sticky="ew", padx=8)
+        self.dictionary_query_entry.bind("<Return>", self.search_dictionary)
+        self.dictionary_search_button = ttk.Button(lookup_frame, text="Look up", command=self.search_dictionary)
+        self.dictionary_search_button.grid(column=2, row=0)
+        ttk.Label(lookup_frame, textvariable=self.dictionary_summary).grid(column=0, row=1, columnspan=3, sticky="w", pady=(8, 0))
+
+        results = ttk.Frame(container)
+        results.grid(column=0, row=3, sticky="nsew", pady=(14, 0))
+        results.columnconfigure(0, weight=1)
+        results.columnconfigure(1, weight=2)
+        results.rowconfigure(0, weight=1)
+
+        matches_frame = ttk.LabelFrame(results, text="Matches", padding=8)
+        matches_frame.grid(column=0, row=0, sticky="nsew", padx=(0, 8))
+        matches_frame.columnconfigure(0, weight=1)
+        matches_frame.rowconfigure(0, weight=1)
+        self.dictionary_matches = tk.Listbox(matches_frame, exportselection=False, height=8)
+        self.dictionary_matches.grid(column=0, row=0, sticky="nsew")
+        self.dictionary_matches.bind("<<ListboxSelect>>", self._on_dictionary_match_selected)
+        matches_scrollbar = ttk.Scrollbar(matches_frame, orient="vertical", command=self.dictionary_matches.yview)
+        matches_scrollbar.grid(column=1, row=0, sticky="ns")
+        self.dictionary_matches.configure(yscrollcommand=matches_scrollbar.set)
+
+        definition_frame = ttk.LabelFrame(results, text="Definition", padding=8)
+        definition_frame.grid(column=1, row=0, sticky="nsew")
+        definition_frame.columnconfigure(0, weight=1)
+        definition_frame.rowconfigure(0, weight=1)
+        self.dictionary_definition = tk.Text(
+            definition_frame,
+            height=8,
+            wrap="word",
+            exportselection=False,
+            state="disabled",
+            font=("Segoe UI", 11),
+        )
+        self.dictionary_definition.grid(column=0, row=0, sticky="nsew")
+        definition_scrollbar = ttk.Scrollbar(definition_frame, orient="vertical", command=self.dictionary_definition.yview)
+        definition_scrollbar.grid(column=1, row=0, sticky="ns")
+        self.dictionary_definition.configure(yscrollcommand=definition_scrollbar.set)
+        self.dictionary_definition.bind("<Control-Return>", self.add_selected_definition_to_draft)
+        self.dictionary_context_menu = tk.Menu(self.root, tearoff=False)
+        self.dictionary_context_menu.add_command(label="Add selected text to draft", command=self.add_selected_definition_to_draft)
+        self.dictionary_definition.bind("<Button-3>", self._show_dictionary_context_menu)
+
+        draft = ttk.LabelFrame(container, text="Flashcard draft", padding=10)
+        draft.grid(column=0, row=4, sticky="ew", pady=(14, 0))
+        draft.columnconfigure(1, weight=1)
+        ttk.Label(draft, text="Chinese").grid(column=0, row=0, sticky="w")
+        ttk.Entry(draft, textvariable=self.draft_chinese).grid(column=1, row=0, sticky="ew", padx=8)
+        ttk.Label(draft, text="Pinyin").grid(column=0, row=1, sticky="w", pady=(8, 0))
+        ttk.Entry(draft, textvariable=self.draft_pinyin).grid(column=1, row=1, sticky="ew", padx=8, pady=(8, 0))
+        ttk.Label(draft, text="Meaning").grid(column=0, row=2, sticky="nw", pady=(8, 0))
+        self.draft_meaning = tk.Text(draft, height=3, wrap="word", font=("Segoe UI", 10))
+        self.draft_meaning.grid(column=1, row=2, sticky="ew", padx=8, pady=(8, 0))
+        ttk.Button(draft, text="Add draft to queue", command=self.add_draft_to_queue).grid(column=1, row=3, sticky="e", pady=(8, 0))
+
+        queue_frame = ttk.LabelFrame(container, text="Dictionary card queue", padding=8)
+        queue_frame.grid(column=0, row=5, sticky="nsew", pady=(14, 0))
+        queue_frame.columnconfigure(0, weight=1)
+        queue_frame.rowconfigure(0, weight=1)
+        self.dictionary_card_queue = ttk.Treeview(queue_frame, columns=("Chinese", "Pinyin", "English"), show="headings", height=6)
+        for column, width in (("Chinese", 180), ("Pinyin", 200), ("English", 480)):
+            self.dictionary_card_queue.heading(column, text=column)
+            self.dictionary_card_queue.column(column, width=width, anchor="w")
+        self.dictionary_card_queue.grid(column=0, row=0, sticky="nsew")
+        queue_scrollbar = ttk.Scrollbar(queue_frame, orient="vertical", command=self.dictionary_card_queue.yview)
+        queue_scrollbar.grid(column=1, row=0, sticky="ns")
+        self.dictionary_card_queue.configure(yscrollcommand=queue_scrollbar.set)
+        queue_actions = ttk.Frame(queue_frame)
+        queue_actions.grid(column=0, row=1, columnspan=2, sticky="ew", pady=(8, 0))
+        queue_actions.columnconfigure(0, weight=1)
+        ttk.Button(queue_actions, text="Remove selected", command=self.remove_selected_dictionary_cards).grid(column=1, row=0)
+        self.add_dictionary_cards_button = ttk.Button(queue_actions, text="Add queued cards to Anki", command=self.add_dictionary_cards_to_anki)
+        self.add_dictionary_cards_button.grid(column=2, row=0, padx=(8, 0))
+
+    def search_dictionary(self, _event=None) -> None:
+        query = self.dictionary_query.get().strip()
+        if not query:
+            messagebox.showinfo("Enter a word", "Enter a Chinese word or character to look it up.")
+            return
+        self.dictionary_search_button.configure(state="disabled")
+        self.dictionary_summary.set(f"Looking up {query}…")
+        threading.Thread(target=self._dictionary_lookup_worker, args=(query,), daemon=True).start()
+
+    def _dictionary_lookup_worker(self, query: str) -> None:
+        try:
+            self.events.put(("dictionary_result", (query, lookup(query))))
+        except Exception as error:
+            self.events.put(("dictionary_error", str(error)))
+
+    def _display_dictionary_results(self, query: str, entries: tuple[DictionaryEntry, ...]) -> None:
+        self.dictionary_entries = entries
+        self.dictionary_matches.delete(0, tk.END)
+        self._set_dictionary_definition("")
+        if not entries:
+            self.dictionary_summary.set(f"No CC-CEDICT entries found for {query!r}.")
+            return
+        self._refresh_dictionary_match_labels()
+        self.dictionary_matches.selection_set(0)
+        self._show_selected_dictionary_entry()
+        self.dictionary_summary.set(f"Found {len(entries)} CC-CEDICT entr{'y' if len(entries) == 1 else 'ies'} for {query!r}.")
+
+    def _refresh_dictionary_match_labels(self) -> None:
+        selected = self.dictionary_matches.curselection()
+        self.dictionary_matches.delete(0, tk.END)
+        for entry in self.dictionary_entries:
+            headword = self._dictionary_headword(entry)
+            preview = entry.definitions[0] if entry.definitions else "No definition"
+            self.dictionary_matches.insert(tk.END, f"{headword} [{entry.pinyin}] — {preview}")
+        if selected and selected[0] < len(self.dictionary_entries):
+            self.dictionary_matches.selection_set(selected[0])
+
+    def _dictionary_headword(self, entry: DictionaryEntry) -> str:
+        return entry.traditional if self.dictionary_character_set.get() == "traditional" else entry.simplified
+
+    def _on_dictionary_match_selected(self, _event=None) -> None:
+        self._show_selected_dictionary_entry()
+
+    def _show_selected_dictionary_entry(self) -> None:
+        selected = self.dictionary_matches.curselection()
+        if not selected or selected[0] >= len(self.dictionary_entries):
+            return
+        entry = self.dictionary_entries[selected[0]]
+        self._set_dictionary_definition(format_definition(entry))
+
+    def _set_dictionary_definition(self, definition: str) -> None:
+        self.dictionary_definition.configure(state="normal")
+        self.dictionary_definition.delete("1.0", tk.END)
+        self.dictionary_definition.insert("1.0", definition)
+        self.dictionary_definition.configure(state="disabled")
+
+    def _show_dictionary_context_menu(self, event) -> str:
+        self.dictionary_context_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def add_selected_definition_to_draft(self, _event=None) -> str | None:
+        selected_entry = self.dictionary_matches.curselection()
+        if not selected_entry or selected_entry[0] >= len(self.dictionary_entries):
+            messagebox.showinfo("Choose an entry", "Choose a dictionary entry before adding a definition.")
+            return "break"
+        try:
+            meaning = self.dictionary_definition.get("sel.first", "sel.last").strip()
+        except tk.TclError:
+            messagebox.showinfo("Select text", "Highlight the part of the definition you want to use first.")
+            return "break"
+        if not meaning:
+            return "break"
+        entry = self.dictionary_entries[selected_entry[0]]
+        self.draft_chinese.set(self._dictionary_headword(entry))
+        self.draft_pinyin.set(entry.pinyin)
+        self.draft_meaning.delete("1.0", tk.END)
+        self.draft_meaning.insert("1.0", meaning)
+        self.status.set("Added selected dictionary text to the flashcard draft.")
+        return "break"
+
+    def add_draft_to_queue(self) -> None:
+        chinese = self.draft_chinese.get().strip()
+        pinyin = self.draft_pinyin.get().strip()
+        meaning = self.draft_meaning.get("1.0", "end-1c").strip()
+        if not all((chinese, pinyin, meaning)):
+            messagebox.showinfo("Complete the draft", "Chinese, Pinyin, and Meaning are all required.")
+            return
+        self.manual_card_number += 1
+        self.dictionary_card_queue.insert("", "end", iid=f"dictionary-{self.manual_card_number}", values=(chinese, pinyin, meaning))
+        self.draft_meaning.delete("1.0", tk.END)
+        self.status.set("Added dictionary card to the queue.")
+
+    def remove_selected_dictionary_cards(self) -> None:
+        selected = self.dictionary_card_queue.selection()
+        for item in selected:
+            self.dictionary_card_queue.delete(item)
+        if selected:
+            self.status.set(f"Removed {len(selected)} dictionary card(s) from the queue.")
+
+    def add_dictionary_cards_to_anki(self) -> None:
+        items = self.dictionary_card_queue.get_children()
+        if not items:
+            messagebox.showinfo("Queue is empty", "Add a dictionary card to the queue before sending cards to Anki.")
+            return
+        deck_name = self.deck_name.get()
+        if not deck_name:
+            messagebox.showinfo("Choose a deck", "Choose a target Anki deck on the Cards tab first.")
+            return
+        if not messagebox.askyesno("Add cards to Anki", f"Add {len(items)} dictionary card(s) to {deck_name!r}?"):
+            return
+        cards = [self.dictionary_card_queue.item(item, "values") for item in items]
+        self.add_dictionary_cards_button.configure(state="disabled")
+        threading.Thread(target=self._add_dictionary_cards_worker, args=(deck_name, cards), daemon=True).start()
+
+    def _add_dictionary_cards_worker(self, deck_name: str, cards: list[tuple[str, str, str]]) -> None:
+        try:
+            for number, (chinese, pinyin, english) in enumerate(cards, start=1):
+                add_three_sided_card(deck_name=deck_name, english=english, chinese=chinese, pinyin=pinyin)
+                self.events.put(("dictionary_progress", f"Added {number} of {len(cards)} dictionary card(s) to {deck_name!r}."))
+            self.events.put(("dictionary_complete", f"Finished adding {len(cards)} dictionary card(s) to {deck_name!r}."))
+        except Exception as error:
+            self.events.put(("dictionary_add_error", f"No more dictionary cards were added: {error}"))
+        finally:
+            self.events.put(("dictionary_done", ""))
+
     def _build_pdf_ocr_tab(self, container: ttk.Frame) -> None:
+        # OCR/PDF integration is intentionally paused while new features are
+        # developed. Keep the tab available as a lightweight future home.
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+        ttk.Label(
+            container,
+            text="PDF & OCR features are temporarily disabled on this branch.",
+            justify="center",
+        ).grid(column=0, row=0, sticky="nsew")
+        return
+
+        # The previous PDF viewer and OCR controls remain below for reference
+        # while this branch is used for faster builds.
         container.columnconfigure(1, weight=1)
         container.rowconfigure(0, weight=1)
 
@@ -291,7 +533,7 @@ class ExcelToAnkiApp:
         if self.pdf_document is None or self.pdf_canvas.winfo_width() <= 1:
             return
         try:
-            import pymupdf
+            # import pymupdf  # Temporarily disabled on the fast-build branch.
 
             page = self.pdf_document.load_page(self.pdf_page_index)
             self._size_pdf_viewer(page)
@@ -512,6 +754,35 @@ class ExcelToAnkiApp:
         ).grid(column=0, row=0, sticky="w")
         ttk.Button(anki_settings, text="Refresh Anki decks", command=self.refresh_decks).grid(column=1, row=0, sticky="e", padx=(12, 0))
 
+        dictionary_settings = ttk.LabelFrame(container, text="Dictionary character set", padding=12)
+        dictionary_settings.grid(column=0, row=3, sticky="ew", pady=(14, 0))
+        ttk.Label(
+            dictionary_settings,
+            text="Choose which character form is shown in dictionary matches and copied into flashcard drafts.",
+            wraplength=720,
+            justify="left",
+        ).grid(column=0, row=0, columnspan=2, sticky="w")
+        ttk.Radiobutton(
+            dictionary_settings,
+            text="Simplified",
+            value="simplified",
+            variable=self.dictionary_character_set,
+            command=self._dictionary_character_set_changed,
+        ).grid(column=0, row=1, sticky="w", pady=(8, 0))
+        ttk.Radiobutton(
+            dictionary_settings,
+            text="Traditional",
+            value="traditional",
+            variable=self.dictionary_character_set,
+            command=self._dictionary_character_set_changed,
+        ).grid(column=1, row=1, sticky="w", padx=(20, 0), pady=(8, 0))
+
+    def _dictionary_character_set_changed(self) -> None:
+        """Refresh dictionary labels without requiring a new lookup."""
+        if self.dictionary_entries:
+            self._refresh_dictionary_match_labels()
+            self._show_selected_dictionary_entry()
+
     def choose_file(self) -> None:
         selected = filedialog.askopenfilename(title="Choose vocabulary workbook", filetypes=[("Excel workbooks", "*.xlsx *.xls"), ("All files", "*.*")])
         if not selected:
@@ -649,6 +920,21 @@ class ExcelToAnkiApp:
                     messagebox.showerror("Could not add cards", message)
                 elif event == "done":
                     self.add_button.configure(state="normal")
+                elif event == "dictionary_result":
+                    query, entries = message
+                    self._display_dictionary_results(query, entries)
+                    self.dictionary_search_button.configure(state="normal")
+                elif event == "dictionary_error":
+                    self.dictionary_summary.set("The dictionary could not be loaded.")
+                    self.dictionary_search_button.configure(state="normal")
+                    messagebox.showerror("Could not look up dictionary entry", message)
+                elif event == "dictionary_add_error":
+                    messagebox.showerror("Could not add dictionary cards", message)
+                elif event == "dictionary_complete":
+                    for item in self.dictionary_card_queue.get_children():
+                        self.dictionary_card_queue.delete(item)
+                elif event == "dictionary_done":
+                    self.add_dictionary_cards_button.configure(state="normal")
                 elif event == "ocr_result":
                     self._display_ocr_result(message)
                 elif event == "ocr_error":

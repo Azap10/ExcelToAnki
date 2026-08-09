@@ -3,7 +3,7 @@ openpyxl
 pyautogui
 pyperclip
 anki
-pymupdf
-Pillow
-paddlepaddle>=3.0
-paddleocr
+# pymupdf  # Temporarily disabled on the fast-build branch.
+# Pillow  # Temporarily disabled on the fast-build branch.
+# paddlepaddle>=3.0  # Temporarily disabled on the fast-build branch.
+# paddleocr  # Temporarily disabled on the fast-build branch.
