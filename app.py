@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+from io import BytesIO
 import queue
 import threading
 import tkinter as tk
@@ -9,8 +11,16 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from ankiHelpers import add_three_sided_card, list_decks
+from ocrHelpers import create_ocr_engine, open_pdf, process_pdf_page, process_pdf_region
+from PIL import Image
 
 REQUIRED_COLUMNS = ("Chinese", "Pinyin", "English", "Lesson", "Character")
+PDF_RENDER_OVERSAMPLE = 2
+PDF_VIEWER_PADDING = 16
+PDF_VIEWER_MAX_WIDTH = 760
+PDF_VIEWER_MAX_HEIGHT = 860
+PDF_VIEWER_MIN_WIDTH = 360
+PDF_VIEWER_MIN_HEIGHT = 480
 
 
 class ExcelToAnkiApp:
@@ -18,21 +28,38 @@ class ExcelToAnkiApp:
         self.root = root
         self.root.title("Excel to Anki")
         self.root.minsize(850, 500)
+        self.root.state("zoomed")
         self.dataframe = None
         self.filtered_rows = None
+        self.pdf_document = None
+        self.pdf_path: Path | None = None
+        self.pdf_page_index = 0
+        self.pdf_image = None
+        self.pdf_display_bounds: tuple[int, int, int, int] | None = None
+        self.pdf_render_job = None
+        self.ocr_engine = None
+        self.entry_selection_active = False
+        self.selection_start: tuple[int, int] | None = None
+        self.selection_rectangle = None
+        self.pending_entry_text = ""
         self.lesson_values: dict[str, object] = {}
         self.card_type_values: dict[str, object] = {}
-        self.events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.events: queue.Queue[tuple[str, object]] = queue.Queue()
 
         self.file_path = tk.StringVar()
         self.lesson = tk.StringVar()
         self.card_type = tk.StringVar()
         self.deck_name = tk.StringVar()
+        self.pdf_file_name = tk.StringVar(value="No PDF selected")
+        self.pdf_page_label = tk.StringVar(value="Page - of -")
+        self.ocr_summary = tk.StringVar(value="Open a PDF, then recognize the current page.")
+        self.entry_summary = tk.StringVar(value="Select Create Entry, then draw a box around text on the page.")
         self.status = tk.StringVar(value="Choose an Excel workbook to begin.")
 
         self._build_interface()
         self.refresh_decks(show_error=False)
         self.root.after(100, self._process_events)
+        self.root.protocol("WM_DELETE_WINDOW", self.close_application)
 
     def _build_interface(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -108,22 +135,366 @@ class ExcelToAnkiApp:
         ttk.Label(container, textvariable=self.status, foreground="#245a36").grid(column=0, row=7, columnspan=3, sticky="w", pady=(6, 0))
 
     def _build_pdf_ocr_tab(self, container: ttk.Frame) -> None:
-        container.columnconfigure(0, weight=1)
-        ttk.Label(container, text="PDF & OCR", font=("Segoe UI", 18, "bold")).grid(column=0, row=0, sticky="w")
-        ttk.Label(
-            container,
-            text="Open bilingual PDFs, inspect pages, and recognize printed Chinese and English text.",
-        ).grid(column=0, row=1, sticky="w", pady=(2, 16))
+        container.columnconfigure(1, weight=1)
+        container.rowconfigure(0, weight=1)
 
-        recognition = ttk.LabelFrame(container, text="Recognition workflow", padding=12)
-        recognition.grid(column=0, row=2, sticky="ew")
+        self.pdf_viewer = ttk.Frame(
+            container,
+            width=PDF_VIEWER_MIN_WIDTH + PDF_VIEWER_PADDING * 2,
+            height=PDF_VIEWER_MIN_HEIGHT + PDF_VIEWER_PADDING * 2,
+        )
+        self.pdf_viewer.grid(column=0, row=0, sticky="nw")
+        self.pdf_viewer.grid_propagate(False)
+        viewer = self.pdf_viewer
+        viewer.columnconfigure(0, weight=1)
+        viewer.rowconfigure(0, weight=1)
+        self.pdf_canvas = tk.Canvas(viewer, background="#2d2d2d", highlightthickness=0)
+        self.pdf_canvas.grid(column=0, row=0, sticky="nsew")
+        self.pdf_canvas.create_text(
+            300,
+            250,
+            text="Open a PDF to preview it here",
+            fill="#d7d7d7",
+            font=("Segoe UI", 14),
+        )
+        self.pdf_canvas.bind("<Configure>", self._queue_pdf_render)
+        self.pdf_canvas.bind("<ButtonPress-1>", self._begin_pdf_selection)
+        self.pdf_canvas.bind("<B1-Motion>", self._draw_pdf_selection)
+        self.pdf_canvas.bind("<ButtonRelease-1>", self._finish_pdf_selection)
+
+        processing = ttk.Frame(container)
+        processing.grid(column=1, row=0, sticky="nsew", padx=(18, 0))
+        processing.columnconfigure(0, weight=1)
+        processing.rowconfigure(2, weight=1)
+
+        controls = ttk.LabelFrame(processing, text="PDF controls", padding=12)
+        controls.grid(column=0, row=0, sticky="new")
+        controls.columnconfigure(0, weight=1)
+        ttk.Button(controls, text="Open PDF", command=self.choose_pdf).grid(column=0, row=0, sticky="ew")
+        ttk.Label(controls, textvariable=self.pdf_file_name, wraplength=520, justify="left").grid(column=0, row=1, sticky="w", pady=(10, 16))
+
+        navigation = ttk.LabelFrame(controls, text="Page", padding=8)
+        navigation.grid(column=0, row=2, sticky="ew")
+        navigation.columnconfigure(1, weight=1)
+        self.previous_pdf_button = ttk.Button(navigation, text="Previous", command=lambda: self.change_pdf_page(-1), state="disabled")
+        self.previous_pdf_button.grid(column=0, row=0, sticky="w")
+        self.next_pdf_button = ttk.Button(navigation, text="Next", command=lambda: self.change_pdf_page(1), state="disabled")
+        self.next_pdf_button.grid(column=2, row=0, sticky="e")
+        ttk.Label(navigation, textvariable=self.pdf_page_label).grid(column=0, row=1, columnspan=3, pady=(8, 0))
+
+        entry = ttk.LabelFrame(controls, text="Create Entry", padding=8)
+        entry.grid(column=0, row=3, sticky="ew", pady=(14, 0))
+        entry.columnconfigure(0, weight=1)
+        self.create_entry_button = ttk.Button(
+            entry,
+            text="Create Entry",
+            command=self.start_entry_selection,
+            state="disabled",
+        )
+        self.create_entry_button.grid(column=0, row=0, sticky="w")
+        ttk.Label(entry, textvariable=self.entry_summary, wraplength=500, justify="left").grid(
+            column=0, row=1, sticky="w", pady=(8, 0)
+        )
+        entry_actions = ttk.Frame(entry)
+        entry_actions.grid(column=0, row=2, sticky="w", pady=(8, 0))
+        self.confirm_entry_button = ttk.Button(
+            entry_actions,
+            text="Confirm entry",
+            command=self.confirm_pending_entry,
+            state="disabled",
+        )
+        self.confirm_entry_button.grid(column=0, row=0)
+        self.retry_entry_button = ttk.Button(
+            entry_actions,
+            text="Retry selection",
+            command=self.start_entry_selection,
+            state="disabled",
+        )
+        self.retry_entry_button.grid(column=1, row=0, padx=(8, 0))
+
+        ocr = ttk.LabelFrame(processing, text="OCR", padding=12)
+        ocr.grid(column=0, row=1, sticky="ew", pady=(14, 0))
+        ocr.columnconfigure(0, weight=1)
+        self.recognize_page_button = ttk.Button(
+            ocr,
+            text="Recognize current page",
+            command=self.recognize_current_pdf_page,
+            state="disabled",
+        )
+        self.recognize_page_button.grid(column=0, row=0, sticky="w")
         ttk.Label(
-            recognition,
-            text="PDF viewing and page-by-page PaddleOCR recognition will be added here next. "
-            "The original PDF will remain unchanged during recognition.",
-            wraplength=720,
+            ocr,
+            textvariable=self.ocr_summary,
+            wraplength=520,
             justify="left",
-        ).grid(column=0, row=0, sticky="w")
+        ).grid(column=0, row=1, sticky="w", pady=(8, 0))
+
+        created_entries = ttk.LabelFrame(processing, text="Created entries", padding=8)
+        created_entries.grid(column=0, row=2, sticky="nsew", pady=(14, 0))
+        created_entries.columnconfigure(0, weight=1)
+        created_entries.rowconfigure(0, weight=1)
+        self.created_entries = ttk.Treeview(
+            created_entries,
+            columns=("Page", "Text"),
+            show="headings",
+            height=16,
+        )
+        for column, width in (("Page", 70), ("Text", 560)):
+            self.created_entries.heading(column, text=column)
+            self.created_entries.column(column, width=width, anchor="w")
+        entries_scrollbar = ttk.Scrollbar(created_entries, orient="vertical", command=self.created_entries.yview)
+        self.created_entries.configure(yscrollcommand=entries_scrollbar.set)
+        self.created_entries.grid(column=0, row=0, sticky="nsew")
+        entries_scrollbar.grid(column=1, row=0, sticky="ns")
+
+    def choose_pdf(self) -> None:
+        selected = filedialog.askopenfilename(title="Open PDF", filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")])
+        if not selected:
+            return
+        try:
+            document = open_pdf(selected)
+        except Exception as error:
+            messagebox.showerror("Could not open PDF", str(error))
+            return
+
+        self._close_pdf_document()
+        self.pdf_document = document
+        self.pdf_path = Path(selected)
+        self.pdf_page_index = 0
+        self.pdf_file_name.set(Path(selected).name)
+        self.ocr_summary.set("Ready to recognize the current page.")
+        self._reset_pending_entry()
+        self.recognize_page_button.configure(state="normal")
+        self.create_entry_button.configure(state="normal")
+        self._show_pdf_page()
+        self.status.set(f"Opened {Path(selected).name}: {document.page_count} page(s).")
+
+    def change_pdf_page(self, offset: int) -> None:
+        if self.pdf_document is None:
+            return
+        target_page = self.pdf_page_index + offset
+        if 0 <= target_page < self.pdf_document.page_count:
+            self.pdf_page_index = target_page
+            self.ocr_summary.set("Ready to recognize the current page.")
+            self._reset_pending_entry()
+            self._show_pdf_page()
+
+    def _queue_pdf_render(self, _event=None) -> None:
+        if self.pdf_document is None:
+            return
+        if self.pdf_render_job is not None:
+            self.root.after_cancel(self.pdf_render_job)
+        self.pdf_render_job = self.root.after(120, self._show_pdf_page)
+
+    def _show_pdf_page(self) -> None:
+        self.pdf_render_job = None
+        if self.pdf_document is None or self.pdf_canvas.winfo_width() <= 1:
+            return
+        try:
+            import pymupdf
+
+            page = self.pdf_document.load_page(self.pdf_page_index)
+            self._size_pdf_viewer(page)
+            self.root.update_idletasks()
+            available_width = max(self.pdf_canvas.winfo_width() - PDF_VIEWER_PADDING * 2, 100)
+            available_height = max(self.pdf_canvas.winfo_height() - PDF_VIEWER_PADDING * 2, 100)
+            scale = min(available_width / page.rect.width, available_height / page.rect.height)
+            render_scale = scale * PDF_RENDER_OVERSAMPLE
+            pixmap = page.get_pixmap(matrix=pymupdf.Matrix(render_scale, render_scale), alpha=False)
+            rendered_image = Image.open(BytesIO(pixmap.tobytes("png")))
+            display_size = (
+                max(1, round(pixmap.width / PDF_RENDER_OVERSAMPLE)),
+                max(1, round(pixmap.height / PDF_RENDER_OVERSAMPLE)),
+            )
+            rendered_image = rendered_image.resize(display_size, Image.Resampling.LANCZOS)
+            image_buffer = BytesIO()
+            rendered_image.save(image_buffer, format="PNG")
+            image_data = base64.b64encode(image_buffer.getvalue()).decode("ascii")
+            self.pdf_image = tk.PhotoImage(data=image_data)
+        except Exception as error:
+            messagebox.showerror("Could not render PDF page", str(error))
+            return
+
+        self.pdf_canvas.delete("all")
+        x_offset = max((self.pdf_canvas.winfo_width() - self.pdf_image.width()) // 2, 0)
+        y_offset = max((self.pdf_canvas.winfo_height() - self.pdf_image.height()) // 2, 0)
+        self.pdf_canvas.create_image(x_offset, y_offset, anchor="nw", image=self.pdf_image)
+        self.pdf_display_bounds = (x_offset, y_offset, self.pdf_image.width(), self.pdf_image.height())
+        self.pdf_page_label.set(f"Page {self.pdf_page_index + 1} of {self.pdf_document.page_count}")
+        self.previous_pdf_button.configure(state="normal" if self.pdf_page_index > 0 else "disabled")
+        is_last_page = self.pdf_page_index >= self.pdf_document.page_count - 1
+        self.next_pdf_button.configure(state="disabled" if is_last_page else "normal")
+
+    def _size_pdf_viewer(self, page) -> None:
+        """Keep the preview sized to the page, leaving workspace for OCR tools."""
+        page_scale = min(
+            1.0,
+            PDF_VIEWER_MAX_WIDTH / page.rect.width,
+            PDF_VIEWER_MAX_HEIGHT / page.rect.height,
+        )
+        width = max(PDF_VIEWER_MIN_WIDTH, round(page.rect.width * page_scale))
+        height = max(PDF_VIEWER_MIN_HEIGHT, round(page.rect.height * page_scale))
+        self.pdf_viewer.configure(
+            width=width + PDF_VIEWER_PADDING * 2,
+            height=height + PDF_VIEWER_PADDING * 2,
+        )
+
+    def recognize_current_pdf_page(self) -> None:
+        if self.pdf_path is None or self.pdf_document is None:
+            messagebox.showinfo("Open a PDF", "Open a PDF before running OCR.")
+            return
+
+        pdf_path = self.pdf_path
+        page_index = self.pdf_page_index
+        self.recognize_page_button.configure(state="disabled")
+        self.ocr_summary.set(f"Recognizing page {page_index + 1}…")
+        threading.Thread(
+            target=self._recognize_pdf_page_worker,
+            args=(pdf_path, page_index),
+            daemon=True,
+        ).start()
+
+    def start_entry_selection(self) -> None:
+        if self.pdf_document is None or self.pdf_display_bounds is None:
+            messagebox.showinfo("Open a PDF", "Open a PDF before creating an entry.")
+            return
+        self.entry_selection_active = True
+        self.selection_start = None
+        self.pending_entry_text = ""
+        self.pdf_canvas.delete("entry_selection")
+        self.pdf_canvas.configure(cursor="crosshair")
+        self.entry_summary.set("Draw a box around the text you want to recognize.")
+        self.confirm_entry_button.configure(state="disabled")
+        self.retry_entry_button.configure(state="disabled")
+
+    def _begin_pdf_selection(self, event) -> None:
+        if not self.entry_selection_active or not self._point_in_pdf(event.x, event.y):
+            return
+        self.selection_start = (event.x, event.y)
+        self.pdf_canvas.delete("entry_selection")
+        self.selection_rectangle = self.pdf_canvas.create_rectangle(
+            event.x,
+            event.y,
+            event.x,
+            event.y,
+            outline="#2d8cff",
+            width=2,
+            tags="entry_selection",
+        )
+
+    def _draw_pdf_selection(self, event) -> None:
+        if self.selection_start is None or self.selection_rectangle is None:
+            return
+        x, y = self._clamp_to_pdf(event.x, event.y)
+        self.pdf_canvas.coords(self.selection_rectangle, *self.selection_start, x, y)
+
+    def _finish_pdf_selection(self, event) -> None:
+        if self.selection_start is None or self.selection_rectangle is None:
+            return
+        end_x, end_y = self._clamp_to_pdf(event.x, event.y)
+        start_x, start_y = self.selection_start
+        self.selection_start = None
+        if abs(end_x - start_x) < 8 or abs(end_y - start_y) < 8:
+            self.pdf_canvas.delete("entry_selection")
+            self.selection_rectangle = None
+            self.entry_summary.set("Select a larger text region, then release the mouse button.")
+            return
+        self.pdf_canvas.coords(self.selection_rectangle, start_x, start_y, end_x, end_y)
+        self.entry_selection_active = False
+        self.pdf_canvas.configure(cursor="")
+        self.create_entry_button.configure(state="disabled")
+        self.entry_summary.set("Recognizing selected region…")
+        pdf_rect = self._canvas_selection_to_pdf_rect(start_x, start_y, end_x, end_y)
+        threading.Thread(
+            target=self._recognize_pdf_region_worker,
+            args=(self.pdf_path, self.pdf_page_index, pdf_rect),
+            daemon=True,
+        ).start()
+
+    def _point_in_pdf(self, x: int, y: int) -> bool:
+        if self.pdf_display_bounds is None:
+            return False
+        left, top, width, height = self.pdf_display_bounds
+        return left <= x <= left + width and top <= y <= top + height
+
+    def _clamp_to_pdf(self, x: int, y: int) -> tuple[int, int]:
+        left, top, width, height = self.pdf_display_bounds
+        return min(max(x, left), left + width), min(max(y, top), top + height)
+
+    def _canvas_selection_to_pdf_rect(self, x0: int, y0: int, x1: int, y1: int) -> tuple[float, float, float, float]:
+        page = self.pdf_document.load_page(self.pdf_page_index)
+        left, top, width, height = self.pdf_display_bounds
+        return (
+            page.rect.x0 + (min(x0, x1) - left) / width * page.rect.width,
+            page.rect.y0 + (min(y0, y1) - top) / height * page.rect.height,
+            page.rect.x0 + (max(x0, x1) - left) / width * page.rect.width,
+            page.rect.y0 + (max(y0, y1) - top) / height * page.rect.height,
+        )
+
+    def _recognize_pdf_page_worker(self, pdf_path: Path, page_index: int) -> None:
+        document = None
+        try:
+            if self.ocr_engine is None:
+                self.ocr_engine = create_ocr_engine()
+            document = open_pdf(pdf_path)
+            result = process_pdf_page(document, page_index, self.ocr_engine)
+            self.events.put(("ocr_result", result))
+        except Exception as error:
+            self.events.put(("ocr_error", str(error)))
+        finally:
+            if document is not None:
+                document.close()
+            self.events.put(("ocr_done", ""))
+
+    def _recognize_pdf_region_worker(self, pdf_path: Path, page_index: int, pdf_rect) -> None:
+        document = None
+        try:
+            if self.ocr_engine is None:
+                self.ocr_engine = create_ocr_engine()
+            document = open_pdf(pdf_path)
+            result = process_pdf_region(document, page_index, self.ocr_engine, pdf_rect)
+            text = "\n".join(span.text for span in result.spans).strip()
+            if not text:
+                raise ValueError("No text was recognized in the selected region. Try a larger selection.")
+            self.events.put(("entry_result", (page_index, text)))
+        except Exception as error:
+            self.events.put(("entry_error", str(error)))
+        finally:
+            if document is not None:
+                document.close()
+            self.events.put(("entry_done", ""))
+
+    def _reset_pending_entry(self) -> None:
+        self.entry_selection_active = False
+        self.selection_start = None
+        self.selection_rectangle = None
+        self.pending_entry_text = ""
+        self.pdf_canvas.delete("entry_selection")
+        self.pdf_canvas.configure(cursor="")
+        self.entry_summary.set("Select Create Entry, then draw a box around text on the page.")
+        self.confirm_entry_button.configure(state="disabled")
+        self.retry_entry_button.configure(state="disabled")
+
+    def _display_ocr_result(self, result) -> None:
+        self.ocr_summary.set(f"Recognized {len(result.spans)} text region(s) on page {result.page_index + 1}.")
+
+    def confirm_pending_entry(self) -> None:
+        if not self.pending_entry_text:
+            return
+        self.created_entries.insert("", "end", values=(self.pdf_page_index + 1, self.pending_entry_text.replace("\n", "  ")))
+        self._reset_pending_entry()
+        self.entry_summary.set("Entry added. Select Create Entry to add another.")
+
+    def _close_pdf_document(self) -> None:
+        if self.pdf_document is not None:
+            self.pdf_document.close()
+            self.pdf_document = None
+        self.pdf_path = None
+        self.pdf_image = None
+
+    def close_application(self) -> None:
+        self._close_pdf_document()
+        self.root.destroy()
 
     def _build_settings_tab(self, container: ttk.Frame) -> None:
         container.columnconfigure(0, weight=1)
@@ -272,12 +643,32 @@ class ExcelToAnkiApp:
         try:
             while True:
                 event, message = self.events.get_nowait()
-                if message:
+                if isinstance(message, str) and message:
                     self.status.set(message)
                 if event == "error":
                     messagebox.showerror("Could not add cards", message)
                 elif event == "done":
                     self.add_button.configure(state="normal")
+                elif event == "ocr_result":
+                    self._display_ocr_result(message)
+                elif event == "ocr_error":
+                    self.ocr_summary.set("OCR could not be completed.")
+                    messagebox.showerror("Could not recognize PDF page", message)
+                elif event == "ocr_done":
+                    if self.pdf_document is not None:
+                        self.recognize_page_button.configure(state="normal")
+                elif event == "entry_result":
+                    _page_index, text = message
+                    self.pending_entry_text = text
+                    self.entry_summary.set(f"Review the recognized text:\n{text}")
+                    self.confirm_entry_button.configure(state="normal")
+                    self.retry_entry_button.configure(state="normal")
+                elif event == "entry_error":
+                    self.entry_summary.set("No entry was created. Choose Create Entry and select another region.")
+                    messagebox.showerror("Could not recognize selected region", message)
+                elif event == "entry_done":
+                    if self.pdf_document is not None:
+                        self.create_entry_button.configure(state="normal")
         except queue.Empty:
             pass
         self.root.after(100, self._process_events)

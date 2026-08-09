@@ -7,6 +7,7 @@ or create a text overlay yet.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,6 +97,10 @@ def create_ocr_engine() -> Any:
     current PaddleOCR 3.x API is used first, with a compatibility fallback for
     older PaddleOCR installations.
     """
+    # PaddleX now defaults to Hugging Face for model downloads. BOS is a more
+    # reliable source for this Windows desktop workflow; callers can override
+    # it by setting PADDLE_PDX_MODEL_SOURCE before launching the app.
+    os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "BOS")
     try:
         from paddleocr import PaddleOCR
     except ImportError as error:
@@ -176,6 +181,69 @@ def process_pdf_page(
         image_height=rendered_page.image_height,
         page_width=rendered_page.page_width,
         page_height=rendered_page.page_height,
+        spans=tuple(spans),
+    )
+
+
+def process_pdf_region(
+    document: Any,
+    page_index: int,
+    ocr_engine: Any,
+    pdf_rect: tuple[float, float, float, float],
+    dpi: int = 225,
+    minimum_confidence: float = 0.0,
+) -> PageOcrResult:
+    """Recognize a rectangular region of one PDF page.
+
+    ``pdf_rect`` contains left, top, right, and bottom coordinates in PDF
+    points. The page is rendered at OCR resolution before cropping, so the
+    screen preview's resolution does not limit recognition quality.
+    """
+    if not 0 <= minimum_confidence <= 1:
+        raise ValueError("minimum_confidence must be between 0 and 1.")
+
+    rendered_page = render_pdf_page(document, page_index, dpi=dpi)
+    left, top, right, bottom = pdf_rect
+    left, right = sorted((left, right))
+    top, bottom = sorted((top, bottom))
+    page_left = rendered_page.page_origin_x
+    page_top = rendered_page.page_origin_y
+    page_right = page_left + rendered_page.page_width
+    page_bottom = page_top + rendered_page.page_height
+    left = max(page_left, left)
+    top = max(page_top, top)
+    right = min(page_right, right)
+    bottom = min(page_bottom, bottom)
+    if right <= left or bottom <= top:
+        raise ValueError("The selected OCR region is outside the PDF page.")
+
+    x0 = max(0, round((left - page_left) * rendered_page.point_scale))
+    y0 = max(0, round((top - page_top) * rendered_page.point_scale))
+    x1 = min(rendered_page.image_width, round((right - page_left) * rendered_page.point_scale))
+    y1 = min(rendered_page.image_height, round((bottom - page_top) * rendered_page.point_scale))
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("The selected OCR region is too small to process.")
+
+    region = RenderedPage(
+        page_index=page_index,
+        dpi=dpi,
+        image_bgr=rendered_page.image_bgr[y0:y1, x0:x1].copy(),
+        image_width=x1 - x0,
+        image_height=y1 - y0,
+        page_width=(x1 - x0) / rendered_page.point_scale,
+        page_height=(y1 - y0) / rendered_page.point_scale,
+        page_origin_x=page_left + x0 / rendered_page.point_scale,
+        page_origin_y=page_top + y0 / rendered_page.point_scale,
+        point_scale=rendered_page.point_scale,
+    )
+    spans = recognize_page_text(region, ocr_engine, minimum_confidence)
+    return PageOcrResult(
+        page_index=page_index,
+        dpi=dpi,
+        image_width=region.image_width,
+        image_height=region.image_height,
+        page_width=region.page_width,
+        page_height=region.page_height,
         spans=tuple(spans),
     )
 

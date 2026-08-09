@@ -4,5 +4,6 @@ pyautogui
 pyperclip
 anki
 pymupdf
+Pillow
 paddlepaddle>=3.0
 paddleocr
