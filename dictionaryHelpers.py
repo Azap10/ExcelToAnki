@@ -29,6 +29,51 @@ class DictionaryEntry:
 DictionaryIndex = Mapping[str, tuple[DictionaryEntry, ...]]
 
 
+_TONE_MARKS = {
+    "a": "āáǎà", "e": "ēéěè", "i": "īíǐì", "o": "ōóǒò",
+    "u": "ūúǔù", "ü": "ǖǘǚǜ",
+}
+
+
+def _mark_pinyin_syllable(syllable: str) -> str:
+    """Convert one numbered pinyin syllable to tone-marked pinyin."""
+    if not syllable or not syllable[-1].isdigit():
+        return syllable
+    tone_number = int(syllable[-1])
+    if tone_number not in range(1, 5):
+        return syllable[:-1] if tone_number == 5 else syllable
+
+    base = syllable[:-1].replace("u:", "ü").replace("v", "ü").replace("V", "Ü")
+    lowered = base.lower()
+    if "a" in lowered:
+        vowel_index = lowered.index("a")
+    elif "e" in lowered:
+        vowel_index = lowered.index("e")
+    elif "ou" in lowered:
+        vowel_index = lowered.index("o")
+    else:
+        vowel_index = max(
+            (index for index, character in enumerate(lowered) if character in "iouü"),
+            default=-1,
+        )
+    if vowel_index < 0:
+        return base
+
+    vowel = base[vowel_index]
+    marks = _TONE_MARKS.get(vowel.lower())
+    if marks is None:
+        return base
+    marked = marks[tone_number - 1]
+    if vowel.isupper():
+        marked = marked.upper()
+    return f"{base[:vowel_index]}{marked}{base[vowel_index + 1:]}"
+
+
+def pinyin_with_tone_marks(pinyin: str) -> str:
+    """Convert CC-CEDICT numbered pinyin to tone marks (e.g. ``ni3`` → ``nǐ``)."""
+    return " ".join(_mark_pinyin_syllable(part) for part in pinyin.split())
+
+
 def dictionary_path() -> Path:
     """Return the path to the CC-CEDICT file bundled with the application."""
     return Path(__file__).with_name("data") / "cedict_ts.u8"
@@ -91,3 +136,18 @@ def lookup(word: str, index: DictionaryIndex | None = None) -> tuple[DictionaryE
 def format_definition(entry: DictionaryEntry) -> str:
     """Format definitions for display while leaving the individual meanings selectable."""
     return " / ".join(entry.definitions)
+
+
+def definition_parts(entry: DictionaryEntry) -> tuple[str, ...]:
+    """Split dictionary meanings into checkbox-sized parts.
+
+    CC-CEDICT separates meanings with slashes; parenthesized qualifiers are
+    kept as their own selectable parts so users can include or omit them.
+    """
+    parts: list[str] = []
+    for definition in entry.definitions:
+        for part in re.split(r"[/()]", definition):
+            cleaned = part.strip()
+            if cleaned and cleaned not in parts:
+                parts.append(cleaned)
+    return tuple(parts)

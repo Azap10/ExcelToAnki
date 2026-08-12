@@ -11,7 +11,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from ankiHelpers import add_three_sided_card, list_decks
-from dictionaryHelpers import DictionaryEntry, format_definition, lookup
+from dictionaryHelpers import DictionaryEntry, definition_parts, lookup, pinyin_with_tone_marks
 # OCR/PDF integration is temporarily disabled on this fast-build branch.
 # from ocrHelpers import create_ocr_engine, open_pdf, process_pdf_page, process_pdf_region
 # from PIL import Image
@@ -59,10 +59,17 @@ class ExcelToAnkiApp:
         self.ocr_summary = tk.StringVar(value="Open a PDF, then recognize the current page.")
         self.entry_summary = tk.StringVar(value="Select Create Entry, then draw a box around text on the page.")
         self.dictionary_query = tk.StringVar()
+        self.word_list: list[str] = []
+        self.word_check_vars: dict[str, tk.BooleanVar] = {}
+        self.dictionary_lookup_in_progress = False
         self.dictionary_summary = tk.StringVar(value="Enter a Chinese word or character to search CC-CEDICT.")
         self.dictionary_character_set = tk.StringVar(value="simplified")
         self.draft_chinese = tk.StringVar()
         self.draft_pinyin = tk.StringVar()
+        self.card_source = tk.StringVar(value="Excel workbook")
+        self.preview_source = None
+        self.definition_options: list[tuple[str, tk.BooleanVar]] = []
+        self._definition_option_updates = False
         self.status = tk.StringVar(value="Choose an Excel workbook to begin.")
 
         self._build_interface()
@@ -75,6 +82,7 @@ class ExcelToAnkiApp:
         self.root.rowconfigure(0, weight=1)
         style = ttk.Style(self.root)
         style.configure("TNotebook.Tab", padding=(12, 5))
+        style.configure("LargeWord.TCheckbutton", font=("Segoe UI", 14))
 
         notebook = ttk.Notebook(self.root)
         notebook.grid(column=0, row=0, sticky="nsew", padx=10, pady=10)
@@ -83,9 +91,9 @@ class ExcelToAnkiApp:
         pdf_tab = ttk.Frame(notebook, padding=16)
         dictionary_tab = ttk.Frame(notebook, padding=16)
         settings_tab = ttk.Frame(notebook, padding=16)
-        notebook.add(cards_tab, text="Cards")
-        notebook.add(pdf_tab, text="PDF & OCR")
-        notebook.add(dictionary_tab, text="Dictionary")
+        notebook.add(pdf_tab, text="Choose Words")
+        notebook.add(dictionary_tab, text="Make Cards")
+        notebook.add(cards_tab, text="Upload")
         notebook.add(settings_tab, text="Settings")
 
         self._build_cards_tab(cards_tab)
@@ -94,30 +102,14 @@ class ExcelToAnkiApp:
         self._build_settings_tab(settings_tab)
 
     def _build_cards_tab(self, container: ttk.Frame) -> None:
-        container.columnconfigure(1, weight=1)
-        container.rowconfigure(5, weight=1)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(3, weight=1)
 
-        ttk.Label(container, text="Excel to Anki", font=("Segoe UI", 18, "bold")).grid(column=0, row=0, columnspan=3, sticky="w")
-        ttk.Label(container, text="Preview vocabulary from an Excel file before adding selected cards to Anki.").grid(column=0, row=1, columnspan=3, sticky="w", pady=(2, 14))
-
-        ttk.Label(container, text="Workbook").grid(column=0, row=2, sticky="w")
-        ttk.Entry(container, textvariable=self.file_path, state="readonly").grid(column=1, row=2, sticky="ew", padx=8)
-        ttk.Button(container, text="Choose Excel file", command=self.choose_file).grid(column=2, row=2)
-
-        filters = ttk.LabelFrame(container, text="Filter cards", padding=10)
-        filters.grid(column=0, row=3, columnspan=3, sticky="ew", pady=(16, 8))
-        filters.columnconfigure(1, weight=1)
-        filters.columnconfigure(3, weight=1)
-        ttk.Label(filters, text="Lesson").grid(column=0, row=0, sticky="w")
-        self.lesson_box = ttk.Combobox(filters, textvariable=self.lesson, state="readonly")
-        self.lesson_box.grid(column=1, row=0, sticky="ew", padx=(8, 18))
-        ttk.Label(filters, text="Card type").grid(column=2, row=0, sticky="w")
-        self.type_box = ttk.Combobox(filters, textvariable=self.card_type, state="readonly")
-        self.type_box.grid(column=3, row=0, sticky="ew", padx=8)
-        ttk.Button(filters, text="Preview matching cards", command=self.prepare_cards).grid(column=4, row=0, padx=(10, 0))
+        ttk.Label(container, text="Upload cards to Anki", font=("Segoe UI", 18, "bold")).grid(column=0, row=0, sticky="w")
+        ttk.Label(container, text="Preview cards created in Make Cards, choose a deck, and upload them to Anki.").grid(column=0, row=1, sticky="w", pady=(2, 14))
 
         deck_selector = ttk.LabelFrame(container, text="Target Anki deck", padding=10)
-        deck_selector.grid(column=0, row=4, columnspan=3, sticky="ew", pady=8)
+        deck_selector.grid(column=0, row=2, sticky="ew", pady=8)
         deck_selector.columnconfigure(1, weight=1)
         ttk.Label(deck_selector, text="Deck").grid(column=0, row=0, sticky="w")
         self.deck_box = ttk.Combobox(deck_selector, textvariable=self.deck_name, state="readonly")
@@ -126,11 +118,13 @@ class ExcelToAnkiApp:
         ttk.Label(deck_selector, text="Close Anki before refreshing decks or adding cards.").grid(column=0, row=1, columnspan=3, sticky="w", pady=(6, 0))
 
         preview = ttk.LabelFrame(container, text="Preview", padding=8)
-        preview.grid(column=0, row=5, columnspan=3, sticky="nsew", pady=8)
+        preview.grid(column=0, row=3, sticky="nsew", pady=8)
         preview.columnconfigure(0, weight=1)
         preview.rowconfigure(0, weight=1)
-        self.cards = ttk.Treeview(preview, columns=("Chinese", "Pinyin", "English"), show="headings", height=10)
-        for column, width in (("Chinese", 200), ("Pinyin", 220), ("English", 340)):
+        self.cards = ttk.Treeview(preview, columns=("#", "Chinese", "Pinyin", "English"), show="headings", height=10)
+        self.cards.tag_configure("even", background="#ffffff")
+        self.cards.tag_configure("odd", background="#eef4fb")
+        for column, width in (("#", 55), ("Chinese", 200), ("Pinyin", 220), ("English", 340)):
             self.cards.heading(column, text=column)
             self.cards.column(column, width=width, anchor="w")
         scrollbar = ttk.Scrollbar(preview, orient="vertical", command=self.cards.yview)
@@ -139,12 +133,13 @@ class ExcelToAnkiApp:
         scrollbar.grid(column=1, row=0, sticky="ns")
 
         actions = ttk.Frame(container)
-        actions.grid(column=0, row=6, columnspan=3, sticky="ew", pady=(2, 0))
+        actions.grid(column=0, row=4, sticky="ew", pady=(2, 0))
         actions.columnconfigure(0, weight=1)
+        ttk.Button(actions, text="Refresh preview", command=self.prepare_cards).grid(column=1, row=0, padx=(0, 8))
         self.add_button = ttk.Button(actions, text="Add previewed cards to Anki", command=self.add_previewed_cards)
-        self.add_button.grid(column=1, row=0, sticky="e")
+        self.add_button.grid(column=2, row=0, sticky="e")
 
-        ttk.Label(container, textvariable=self.status, foreground="#245a36").grid(column=0, row=7, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(container, textvariable=self.status, foreground="#245a36").grid(column=0, row=5, sticky="w", pady=(6, 0))
 
     def _build_dictionary_tab(self, container: ttk.Frame) -> None:
         """Build the manual dictionary-lookup and card-queue workflow."""
@@ -155,28 +150,30 @@ class ExcelToAnkiApp:
         ttk.Label(container, text="CC-CEDICT Dictionary", font=("Segoe UI", 18, "bold")).grid(column=0, row=0, sticky="w")
         ttk.Label(
             container,
-            text="Search a word or character, then highlight the meaning you want to use in a flashcard.",
+            text="Choose a word, review its dictionary matches, and build a flashcard.",
         ).grid(column=0, row=1, sticky="w", pady=(2, 14))
 
-        lookup_frame = ttk.LabelFrame(container, text="Look up a word", padding=10)
-        lookup_frame.grid(column=0, row=2, sticky="new")
-        lookup_frame.columnconfigure(1, weight=1)
-        ttk.Label(lookup_frame, text="Word or character").grid(column=0, row=0, sticky="w")
-        self.dictionary_query_entry = ttk.Entry(lookup_frame, textvariable=self.dictionary_query)
-        self.dictionary_query_entry.grid(column=1, row=0, sticky="ew", padx=8)
-        self.dictionary_query_entry.bind("<Return>", self.search_dictionary)
-        self.dictionary_search_button = ttk.Button(lookup_frame, text="Look up", command=self.search_dictionary)
-        self.dictionary_search_button.grid(column=2, row=0)
-        ttk.Label(lookup_frame, textvariable=self.dictionary_summary).grid(column=0, row=1, columnspan=3, sticky="w", pady=(8, 0))
-
         results = ttk.Frame(container)
-        results.grid(column=0, row=3, sticky="nsew", pady=(14, 0))
+        results.grid(column=0, row=2, sticky="nsew", pady=(14, 0))
+        results.columnconfigure(0, weight=1)
         results.columnconfigure(0, weight=1)
         results.columnconfigure(1, weight=2)
+        results.columnconfigure(2, weight=3)
         results.rowconfigure(0, weight=1)
 
+        word_list_frame = ttk.LabelFrame(results, text="Chosen words", padding=8)
+        word_list_frame.grid(column=0, row=0, sticky="nsew", padx=(0, 8))
+        word_list_frame.columnconfigure(0, weight=1)
+        word_list_frame.rowconfigure(0, weight=1)
+        self.chosen_words = tk.Listbox(word_list_frame, exportselection=False, height=8)
+        self.chosen_words.grid(column=0, row=0, sticky="nsew")
+        self.chosen_words.bind("<<ListboxSelect>>", self._on_chosen_word_selected)
+        chosen_scrollbar = ttk.Scrollbar(word_list_frame, orient="vertical", command=self.chosen_words.yview)
+        chosen_scrollbar.grid(column=1, row=0, sticky="ns")
+        self.chosen_words.configure(yscrollcommand=chosen_scrollbar.set)
+
         matches_frame = ttk.LabelFrame(results, text="Matches", padding=8)
-        matches_frame.grid(column=0, row=0, sticky="nsew", padx=(0, 8))
+        matches_frame.grid(column=1, row=0, sticky="nsew", padx=(0, 8))
         matches_frame.columnconfigure(0, weight=1)
         matches_frame.rowconfigure(0, weight=1)
         self.dictionary_matches = tk.Listbox(matches_frame, exportselection=False, height=8)
@@ -187,25 +184,11 @@ class ExcelToAnkiApp:
         self.dictionary_matches.configure(yscrollcommand=matches_scrollbar.set)
 
         definition_frame = ttk.LabelFrame(results, text="Definition", padding=8)
-        definition_frame.grid(column=1, row=0, sticky="nsew")
+        definition_frame.grid(column=2, row=0, sticky="nsew")
         definition_frame.columnconfigure(0, weight=1)
         definition_frame.rowconfigure(0, weight=1)
-        self.dictionary_definition = tk.Text(
-            definition_frame,
-            height=8,
-            wrap="word",
-            exportselection=False,
-            state="disabled",
-            font=("Segoe UI", 11),
-        )
+        self.dictionary_definition = ttk.Frame(definition_frame)
         self.dictionary_definition.grid(column=0, row=0, sticky="nsew")
-        definition_scrollbar = ttk.Scrollbar(definition_frame, orient="vertical", command=self.dictionary_definition.yview)
-        definition_scrollbar.grid(column=1, row=0, sticky="ns")
-        self.dictionary_definition.configure(yscrollcommand=definition_scrollbar.set)
-        self.dictionary_definition.bind("<Control-Return>", self.add_selected_definition_to_draft)
-        self.dictionary_context_menu = tk.Menu(self.root, tearoff=False)
-        self.dictionary_context_menu.add_command(label="Add selected text to draft", command=self.add_selected_definition_to_draft)
-        self.dictionary_definition.bind("<Button-3>", self._show_dictionary_context_menu)
 
         draft = ttk.LabelFrame(container, text="Flashcard draft", padding=10)
         draft.grid(column=0, row=4, sticky="ew", pady=(14, 0))
@@ -217,14 +200,20 @@ class ExcelToAnkiApp:
         ttk.Label(draft, text="Meaning").grid(column=0, row=2, sticky="nw", pady=(8, 0))
         self.draft_meaning = tk.Text(draft, height=3, wrap="word", font=("Segoe UI", 10))
         self.draft_meaning.grid(column=1, row=2, sticky="ew", padx=8, pady=(8, 0))
-        ttk.Button(draft, text="Add draft to queue", command=self.add_draft_to_queue).grid(column=1, row=3, sticky="e", pady=(8, 0))
+        tag_actions = ttk.Frame(draft)
+        tag_actions.grid(column=1, row=3, sticky="w", padx=8, pady=(8, 0))
+        for tag in ("(adj.)", "(v.)", "(n.)", "(adv.)", "(m.)"):
+            ttk.Button(tag_actions, text=tag, command=lambda value=tag: self.add_definition_tag(value)).pack(side="left", padx=(0, 5))
+        ttk.Button(draft, text="Add draft to queue", command=self.add_draft_to_queue).grid(column=1, row=4, sticky="e", pady=(8, 0))
 
         queue_frame = ttk.LabelFrame(container, text="Dictionary card queue", padding=8)
         queue_frame.grid(column=0, row=5, sticky="nsew", pady=(14, 0))
         queue_frame.columnconfigure(0, weight=1)
         queue_frame.rowconfigure(0, weight=1)
-        self.dictionary_card_queue = ttk.Treeview(queue_frame, columns=("Chinese", "Pinyin", "English"), show="headings", height=6)
-        for column, width in (("Chinese", 180), ("Pinyin", 200), ("English", 480)):
+        self.dictionary_card_queue = ttk.Treeview(queue_frame, columns=("#", "Chinese", "Pinyin", "English"), show="headings", height=6)
+        self.dictionary_card_queue.tag_configure("even", background="#ffffff")
+        self.dictionary_card_queue.tag_configure("odd", background="#eef4fb")
+        for column, width in (("#", 55), ("Chinese", 180), ("Pinyin", 200), ("English", 480)):
             self.dictionary_card_queue.heading(column, text=column)
             self.dictionary_card_queue.column(column, width=width, anchor="w")
         self.dictionary_card_queue.grid(column=0, row=0, sticky="nsew")
@@ -235,15 +224,67 @@ class ExcelToAnkiApp:
         queue_actions.grid(column=0, row=1, columnspan=2, sticky="ew", pady=(8, 0))
         queue_actions.columnconfigure(0, weight=1)
         ttk.Button(queue_actions, text="Remove selected", command=self.remove_selected_dictionary_cards).grid(column=1, row=0)
-        self.add_dictionary_cards_button = ttk.Button(queue_actions, text="Add queued cards to Anki", command=self.add_dictionary_cards_to_anki)
-        self.add_dictionary_cards_button.grid(column=2, row=0, padx=(8, 0))
+        ttk.Label(queue_actions, text="Use the Upload tab to preview and add this queue to Anki.").grid(column=2, row=0, padx=(12, 0))
+
+    def add_word_to_list(self, _event=None) -> str:
+        word = self.word_entry.get().strip()
+        if not word:
+            return "break"
+        if word not in self.word_list:
+            self.word_list.append(word)
+            self._refresh_word_lists()
+        self.word_entry.delete(0, tk.END)
+        self.chosen_words.selection_clear(0, tk.END)
+        self.chosen_words.selection_set(self.word_list.index(word))
+        self.chosen_words.see(self.word_list.index(word))
+        self.dictionary_query.set(word)
+        self.search_dictionary()
+        return "break"
+
+    def _refresh_word_lists(self) -> None:
+        """Render the shared word list with stable one-based numbering."""
+        for child in self.word_choices_inner.winfo_children():
+            child.destroy()
+        self.word_check_vars = {}
+        self.chosen_words.delete(0, tk.END)
+        for position, word in enumerate(self.word_list, start=1):
+            label = f"{position}. {word}"
+            selected = tk.BooleanVar(value=False)
+            self.word_check_vars[word] = selected
+            ttk.Checkbutton(
+                self.word_choices_inner,
+                text=label,
+                variable=selected,
+                style="LargeWord.TCheckbutton",
+            ).grid(column=0, row=position - 1, sticky="w", pady=(0 if position == 1 else 4, 0))
+            self.chosen_words.insert(tk.END, label)
+
+    def remove_checked_words(self) -> None:
+        checked = {word for word, variable in self.word_check_vars.items() if variable.get()}
+        if checked:
+            self.word_list = [word for word in self.word_list if word not in checked]
+            self._refresh_word_lists()
+
+    def remove_all_words(self) -> None:
+        if self.word_list:
+            self.word_list.clear()
+            self._refresh_word_lists()
+
+    def _on_chosen_word_selected(self, _event=None) -> None:
+        selected = self.chosen_words.curselection()
+        if not selected or selected[0] >= len(self.word_list):
+            return
+        self.dictionary_query.set(self.word_list[selected[0]])
+        self.search_dictionary()
 
     def search_dictionary(self, _event=None) -> None:
         query = self.dictionary_query.get().strip()
         if not query:
             messagebox.showinfo("Enter a word", "Enter a Chinese word or character to look it up.")
             return
-        self.dictionary_search_button.configure(state="disabled")
+        if self.dictionary_lookup_in_progress:
+            return
+        self.dictionary_lookup_in_progress = True
         self.dictionary_summary.set(f"Looking up {query}…")
         threading.Thread(target=self._dictionary_lookup_worker, args=(query,), daemon=True).start()
 
@@ -256,7 +297,7 @@ class ExcelToAnkiApp:
     def _display_dictionary_results(self, query: str, entries: tuple[DictionaryEntry, ...]) -> None:
         self.dictionary_entries = entries
         self.dictionary_matches.delete(0, tk.END)
-        self._set_dictionary_definition("")
+        self._set_definition_options(())
         if not entries:
             self.dictionary_summary.set(f"No CC-CEDICT entries found for {query!r}.")
             return
@@ -286,35 +327,55 @@ class ExcelToAnkiApp:
         if not selected or selected[0] >= len(self.dictionary_entries):
             return
         entry = self.dictionary_entries[selected[0]]
-        self._set_dictionary_definition(format_definition(entry))
+        self._set_definition_options(definition_parts(entry))
+        self.draft_chinese.set(self._dictionary_headword(entry))
+        self.draft_pinyin.set(pinyin_with_tone_marks(entry.pinyin))
 
-    def _set_dictionary_definition(self, definition: str) -> None:
-        self.dictionary_definition.configure(state="normal")
-        self.dictionary_definition.delete("1.0", tk.END)
-        self.dictionary_definition.insert("1.0", definition)
-        self.dictionary_definition.configure(state="disabled")
+    def _set_definition_options(self, definitions: tuple[str, ...]) -> None:
+        """Rebuild definition checkboxes and clear the meaning draft."""
+        self._definition_option_updates = True
+        try:
+            for child in self.dictionary_definition.winfo_children():
+                child.destroy()
+            self.definition_options = []
+            for row, definition in enumerate(definitions):
+                selected = tk.BooleanVar(value=False)
+                ttk.Checkbutton(
+                    self.dictionary_definition,
+                    text=definition,
+                    variable=selected,
+                    command=lambda meaning=definition, value=selected: self._definition_option_toggled(meaning, value),
+                ).grid(column=0, row=row, sticky="w", pady=(0 if row == 0 else 4, 0))
+                self.definition_options.append((definition, selected))
+        finally:
+            self._definition_option_updates = False
+        self.draft_meaning.delete("1.0", tk.END)
 
-    def _show_dictionary_context_menu(self, event) -> str:
-        self.dictionary_context_menu.tk_popup(event.x_root, event.y_root)
-        return "break"
+    def _definition_option_toggled(self, meaning: str, selected: tk.BooleanVar) -> None:
+        """Add/remove one meaning while preserving unrelated draft edits."""
+        if self._definition_option_updates:
+            return
+        current = self.draft_meaning.get("1.0", "end-1c").strip()
+        if selected.get():
+            if meaning not in current.split("; "):
+                updated = f"{current}; {meaning}" if current else meaning
+        else:
+            pieces = [piece for piece in current.split("; ") if piece != meaning]
+            updated = "; ".join(pieces)
+        self.draft_meaning.delete("1.0", tk.END)
+        self.draft_meaning.insert("1.0", updated)
 
     def add_selected_definition_to_draft(self, _event=None) -> str | None:
         selected_entry = self.dictionary_matches.curselection()
         if not selected_entry or selected_entry[0] >= len(self.dictionary_entries):
             messagebox.showinfo("Choose an entry", "Choose a dictionary entry before adding a definition.")
             return "break"
-        try:
-            meaning = self.dictionary_definition.get("sel.first", "sel.last").strip()
-        except tk.TclError:
-            messagebox.showinfo("Select text", "Highlight the part of the definition you want to use first.")
-            return "break"
-        if not meaning:
-            return "break"
         entry = self.dictionary_entries[selected_entry[0]]
         self.draft_chinese.set(self._dictionary_headword(entry))
-        self.draft_pinyin.set(entry.pinyin)
-        self.draft_meaning.delete("1.0", tk.END)
-        self.draft_meaning.insert("1.0", meaning)
+        self.draft_pinyin.set(pinyin_with_tone_marks(entry.pinyin))
+        for meaning, variable in self.definition_options:
+            variable.set(True)
+            self._definition_option_toggled(meaning, variable)
         self.status.set("Added selected dictionary text to the flashcard draft.")
         return "break"
 
@@ -326,15 +387,30 @@ class ExcelToAnkiApp:
             messagebox.showinfo("Complete the draft", "Chinese, Pinyin, and Meaning are all required.")
             return
         self.manual_card_number += 1
-        self.dictionary_card_queue.insert("", "end", iid=f"dictionary-{self.manual_card_number}", values=(chinese, pinyin, meaning))
+        position = len(self.dictionary_card_queue.get_children()) + 1
+        self.dictionary_card_queue.insert(
+            "", "end", iid=f"dictionary-{self.manual_card_number}",
+            values=(position, chinese, pinyin, meaning),
+            tags=("odd" if position % 2 else "even",),
+        )
         self.draft_meaning.delete("1.0", tk.END)
         self.status.set("Added dictionary card to the queue.")
+
+    def add_definition_tag(self, tag: str) -> None:
+        """Append a part-of-speech tag to the meaning without adding punctuation."""
+        current = self.draft_meaning.get("1.0", "end-1c").strip()
+        if tag in current.split():
+            return
+        updated = f"{current} {tag}" if current else tag
+        self.draft_meaning.delete("1.0", tk.END)
+        self.draft_meaning.insert("1.0", updated)
 
     def remove_selected_dictionary_cards(self) -> None:
         selected = self.dictionary_card_queue.selection()
         for item in selected:
             self.dictionary_card_queue.delete(item)
         if selected:
+            self._renumber_treeview(self.dictionary_card_queue)
             self.status.set(f"Removed {len(selected)} dictionary card(s) from the queue.")
 
     def add_dictionary_cards_to_anki(self) -> None:
@@ -348,8 +424,8 @@ class ExcelToAnkiApp:
             return
         if not messagebox.askyesno("Add cards to Anki", f"Add {len(items)} dictionary card(s) to {deck_name!r}?"):
             return
-        cards = [self.dictionary_card_queue.item(item, "values") for item in items]
-        self.add_dictionary_cards_button.configure(state="disabled")
+        cards = [self.dictionary_card_queue.item(item, "values")[1:4] for item in items]
+        self.add_button.configure(state="disabled")
         threading.Thread(target=self._add_dictionary_cards_worker, args=(deck_name, cards), daemon=True).start()
 
     def _add_dictionary_cards_worker(self, deck_name: str, cards: list[tuple[str, str, str]]) -> None:
@@ -367,12 +443,38 @@ class ExcelToAnkiApp:
         # OCR/PDF integration is intentionally paused while new features are
         # developed. Keep the tab available as a lightweight future home.
         container.columnconfigure(0, weight=1)
-        container.rowconfigure(0, weight=1)
+        container.rowconfigure(2, weight=1)
+        ttk.Label(container, text="Choose words", font=("Segoe UI", 18, "bold")).grid(column=0, row=0, sticky="w")
         ttk.Label(
             container,
-            text="PDF & OCR features are temporarily disabled on this branch.",
-            justify="center",
-        ).grid(column=0, row=0, sticky="nsew")
+            text="Add Chinese words manually now. Future OCR selection will add words to this same list.",
+        ).grid(column=0, row=1, sticky="w", pady=(2, 14))
+        word_input = ttk.LabelFrame(container, text="Add a word", padding=10)
+        word_input.grid(column=0, row=2, sticky="new")
+        word_input.columnconfigure(0, weight=1)
+        self.word_entry = ttk.Entry(word_input)
+        self.word_entry.grid(column=0, row=0, sticky="ew")
+        self.word_entry.bind("<Return>", self.add_word_to_list)
+        ttk.Button(word_input, text="Add word", command=self.add_word_to_list).grid(column=1, row=0, padx=(8, 0))
+        self.word_choices_frame = ttk.LabelFrame(container, text="Word list", padding=8)
+        self.word_choices_frame.grid(column=0, row=3, sticky="nsew", pady=(14, 0))
+        self.word_choices_frame.grid_propagate(False)
+        self.word_choices_frame.configure(height=280)
+        self.word_choices_frame.columnconfigure(0, weight=1)
+        self.word_choices_frame.rowconfigure(0, weight=1)
+        self.word_choices_canvas = tk.Canvas(self.word_choices_frame, height=250, highlightthickness=0)
+        self.word_choices_canvas.grid(column=0, row=0, sticky="nsew")
+        word_choices_scrollbar = ttk.Scrollbar(self.word_choices_frame, orient="vertical", command=self.word_choices_canvas.yview)
+        word_choices_scrollbar.grid(column=1, row=0, sticky="ns")
+        self.word_choices_canvas.configure(yscrollcommand=word_choices_scrollbar.set)
+        self.word_choices_inner = ttk.Frame(self.word_choices_canvas)
+        self.word_choices_window = self.word_choices_canvas.create_window((0, 0), window=self.word_choices_inner, anchor="nw")
+        self.word_choices_inner.bind("<Configure>", lambda _event: self.word_choices_canvas.configure(scrollregion=self.word_choices_canvas.bbox("all")))
+        self.word_choices_canvas.bind("<Configure>", lambda event: self.word_choices_canvas.itemconfigure(self.word_choices_window, width=event.width))
+        word_actions = ttk.Frame(container)
+        word_actions.grid(column=0, row=4, sticky="ew", pady=(8, 0))
+        ttk.Button(word_actions, text="Remove checked words", command=self.remove_checked_words).pack(side="left")
+        ttk.Button(word_actions, text="Remove all words", command=self.remove_all_words).pack(side="left", padx=(8, 0))
         return
 
         # The previous PDF viewer and OCR controls remain below for reference
@@ -477,11 +579,13 @@ class ExcelToAnkiApp:
         created_entries.rowconfigure(0, weight=1)
         self.created_entries = ttk.Treeview(
             created_entries,
-            columns=("Page", "Text"),
+            columns=("#", "Page", "Text"),
             show="headings",
             height=16,
         )
-        for column, width in (("Page", 70), ("Text", 560)):
+        self.created_entries.tag_configure("even", background="#ffffff")
+        self.created_entries.tag_configure("odd", background="#eef4fb")
+        for column, width in (("#", 55), ("Page", 70), ("Text", 560)):
             self.created_entries.heading(column, text=column)
             self.created_entries.column(column, width=width, anchor="w")
         entries_scrollbar = ttk.Scrollbar(created_entries, orient="vertical", command=self.created_entries.yview)
@@ -723,7 +827,12 @@ class ExcelToAnkiApp:
     def confirm_pending_entry(self) -> None:
         if not self.pending_entry_text:
             return
-        self.created_entries.insert("", "end", values=(self.pdf_page_index + 1, self.pending_entry_text.replace("\n", "  ")))
+        position = len(self.created_entries.get_children()) + 1
+        self.created_entries.insert(
+            "", "end",
+            values=(position, self.pdf_page_index + 1, self.pending_entry_text.replace("\n", "  ")),
+            tags=("odd" if position % 2 else "even",),
+        )
         self._reset_pending_entry()
         self.entry_summary.set("Entry added. Select Create Entry to add another.")
 
@@ -815,24 +924,44 @@ class ExcelToAnkiApp:
         self.status.set(f"Loaded {Path(selected).name}: {len(dataframe)} rows.")
 
     def prepare_cards(self) -> None:
-        if self.dataframe is None:
-            messagebox.showinfo("Choose a workbook", "Choose an Excel workbook first.")
+        self._prepare_dictionary_cards()
+
+    def _prepare_dictionary_cards(self) -> None:
+        """Copy the Dictionary-tab queue into the shared Cards-tab preview."""
+        import pandas as pd
+
+        queued = [self.dictionary_card_queue.item(item, "values")[1:4] for item in self.dictionary_card_queue.get_children()]
+        if not queued:
+            self.filtered_rows = None
+            self.preview_source = None
+            self._clear_preview()
+            messagebox.showinfo("Dictionary queue is empty", "Add cards to the Dictionary tab queue first.")
             return
-        lesson_label = self.lesson.get()
-        card_type_label = self.card_type.get()
-        if not lesson_label or not card_type_label:
-            messagebox.showinfo("Select filters", "Select both a lesson and a card type.")
-            return
-        lesson = self.lesson_values[lesson_label]
-        card_type = self.card_type_values[card_type_label]
-        rows = self.dataframe[
-            (self.dataframe["Lesson"] == lesson) & (self.dataframe["Character"] == card_type)
-        ][["Chinese", "Pinyin", "English"]].dropna()
+        rows = pd.DataFrame(queued, columns=("Chinese", "Pinyin", "English"))
         self.filtered_rows = rows
+        self.preview_source = "Dictionary queue"
         self._clear_preview()
         for _, row in rows.iterrows():
-            self.cards.insert("", "end", values=(row["Chinese"], row["Pinyin"], row["English"]))
-        self.status.set(f"{len(rows)} matching card(s) ready to add.")
+            position = len(self.cards.get_children()) + 1
+            self.cards.insert(
+                "", "end",
+                values=(position, row["Chinese"], row["Pinyin"], row["English"]),
+                tags=("odd" if position % 2 else "even",),
+            )
+        self.status.set(f"{len(rows)} dictionary card(s) ready to add.")
+
+    def _card_source_changed(self, _event=None) -> None:
+        """Clear the shared preview when switching between card sources."""
+        self.filtered_rows = None
+        self.preview_source = None
+        self._clear_preview()
+        dictionary_source = self.card_source.get() == "Dictionary queue"
+        self.lesson_box.configure(state="disabled" if dictionary_source else "readonly")
+        self.type_box.configure(state="disabled" if dictionary_source else "readonly")
+        if dictionary_source:
+            self.status.set("Dictionary queue selected. Click Preview matching cards to load it.")
+        else:
+            self.status.set("Excel workbook selected. Choose filters, then preview matching cards.")
 
     def refresh_decks(self, show_error: bool = True) -> None:
         previous_deck = self.deck_name.get()
@@ -898,6 +1027,15 @@ class ExcelToAnkiApp:
             self.cards.delete(item)
 
     @staticmethod
+    def _renumber_treeview(tree: ttk.Treeview) -> None:
+        """Keep table numbering and alternating row colors consistent after edits."""
+        for position, item in enumerate(tree.get_children(), start=1):
+            values = list(tree.item(item, "values"))
+            if values:
+                values[0] = position
+                tree.item(item, values=values, tags=("odd" if position % 2 else "even",))
+
+    @staticmethod
     def _lesson_label(value: object) -> str:
         numeric_value = float(value)
         return str(int(numeric_value)) if numeric_value.is_integer() else str(value)
@@ -918,15 +1056,20 @@ class ExcelToAnkiApp:
                     self.status.set(message)
                 if event == "error":
                     messagebox.showerror("Could not add cards", message)
+                elif event == "complete":
+                    if self.preview_source == "Dictionary queue":
+                        for item in self.dictionary_card_queue.get_children():
+                            self.dictionary_card_queue.delete(item)
+                        self.preview_source = None
                 elif event == "done":
                     self.add_button.configure(state="normal")
                 elif event == "dictionary_result":
                     query, entries = message
+                    self.dictionary_lookup_in_progress = False
                     self._display_dictionary_results(query, entries)
-                    self.dictionary_search_button.configure(state="normal")
                 elif event == "dictionary_error":
+                    self.dictionary_lookup_in_progress = False
                     self.dictionary_summary.set("The dictionary could not be loaded.")
-                    self.dictionary_search_button.configure(state="normal")
                     messagebox.showerror("Could not look up dictionary entry", message)
                 elif event == "dictionary_add_error":
                     messagebox.showerror("Could not add dictionary cards", message)
@@ -934,7 +1077,7 @@ class ExcelToAnkiApp:
                     for item in self.dictionary_card_queue.get_children():
                         self.dictionary_card_queue.delete(item)
                 elif event == "dictionary_done":
-                    self.add_dictionary_cards_button.configure(state="normal")
+                    self.add_button.configure(state="normal")
                 elif event == "ocr_result":
                     self._display_ocr_result(message)
                 elif event == "ocr_error":
