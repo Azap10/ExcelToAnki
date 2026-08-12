@@ -141,12 +141,12 @@ def format_definition(entry: DictionaryEntry) -> str:
 def definition_parts(entry: DictionaryEntry) -> tuple[str, ...]:
     """Split dictionary meanings into checkbox-sized parts.
 
-    CC-CEDICT separates meanings with slashes; parenthesized qualifiers are
-    kept as their own selectable parts so users can include or omit them.
+    CC-CEDICT separates meanings with slashes. Parenthesized qualifiers stay
+    attached to their meaning as context.
     """
     parts: list[str] = []
     for definition in entry.definitions:
-        for part in re.split(r"[/()]", definition):
+        for part in definition.split("/"):
             cleaned = part.strip()
             if cleaned and cleaned not in parts:
                 parts.append(cleaned)

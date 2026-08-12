@@ -86,6 +86,7 @@ class ExcelToAnkiApp:
 
         notebook = ttk.Notebook(self.root)
         notebook.grid(column=0, row=0, sticky="nsew", padx=10, pady=10)
+        self.notebook = notebook
 
         cards_tab = ttk.Frame(notebook, padding=16)
         pdf_tab = ttk.Frame(notebook, padding=16)
@@ -100,6 +101,7 @@ class ExcelToAnkiApp:
         self._build_pdf_ocr_tab(pdf_tab)
         self._build_dictionary_tab(dictionary_tab)
         self._build_settings_tab(settings_tab)
+        self.root.bind_all("<KeyPress>", self._handle_make_cards_key)
 
     def _build_cards_tab(self, container: ttk.Frame) -> None:
         container.columnconfigure(0, weight=1)
@@ -144,8 +146,10 @@ class ExcelToAnkiApp:
     def _build_dictionary_tab(self, container: ttk.Frame) -> None:
         """Build the manual dictionary-lookup and card-queue workflow."""
         container.columnconfigure(0, weight=1)
-        container.rowconfigure(2, weight=1)
+        container.rowconfigure(2, weight=0)
         container.rowconfigure(3, weight=1)
+        container.rowconfigure(4, weight=1)
+        container.rowconfigure(5, weight=1)
 
         ttk.Label(container, text="CC-CEDICT Dictionary", font=("Segoe UI", 18, "bold")).grid(column=0, row=0, sticky="w")
         ttk.Label(
@@ -154,18 +158,17 @@ class ExcelToAnkiApp:
         ).grid(column=0, row=1, sticky="w", pady=(2, 14))
 
         results = ttk.Frame(container)
-        results.grid(column=0, row=2, sticky="nsew", pady=(14, 0))
-        results.columnconfigure(0, weight=1)
+        results.grid(column=0, row=2, sticky="ew", pady=(14, 0))
         results.columnconfigure(0, weight=1)
         results.columnconfigure(1, weight=2)
-        results.columnconfigure(2, weight=3)
+        results.columnconfigure(2, weight=2)
         results.rowconfigure(0, weight=1)
 
         word_list_frame = ttk.LabelFrame(results, text="Chosen words", padding=8)
         word_list_frame.grid(column=0, row=0, sticky="nsew", padx=(0, 8))
         word_list_frame.columnconfigure(0, weight=1)
         word_list_frame.rowconfigure(0, weight=1)
-        self.chosen_words = tk.Listbox(word_list_frame, exportselection=False, height=8)
+        self.chosen_words = tk.Listbox(word_list_frame, exportselection=False, height=4)
         self.chosen_words.grid(column=0, row=0, sticky="nsew")
         self.chosen_words.bind("<<ListboxSelect>>", self._on_chosen_word_selected)
         chosen_scrollbar = ttk.Scrollbar(word_list_frame, orient="vertical", command=self.chosen_words.yview)
@@ -176,38 +179,48 @@ class ExcelToAnkiApp:
         matches_frame.grid(column=1, row=0, sticky="nsew", padx=(0, 8))
         matches_frame.columnconfigure(0, weight=1)
         matches_frame.rowconfigure(0, weight=1)
-        self.dictionary_matches = tk.Listbox(matches_frame, exportselection=False, height=8)
+        self.dictionary_matches = tk.Listbox(matches_frame, exportselection=False, height=4)
         self.dictionary_matches.grid(column=0, row=0, sticky="nsew")
         self.dictionary_matches.bind("<<ListboxSelect>>", self._on_dictionary_match_selected)
         matches_scrollbar = ttk.Scrollbar(matches_frame, orient="vertical", command=self.dictionary_matches.yview)
         matches_scrollbar.grid(column=1, row=0, sticky="ns")
         self.dictionary_matches.configure(yscrollcommand=matches_scrollbar.set)
 
-        definition_frame = ttk.LabelFrame(results, text="Definition", padding=8)
-        definition_frame.grid(column=2, row=0, sticky="nsew")
+        identity = ttk.LabelFrame(results, text="Flashcard Chinese / Pinyin", padding=8)
+        identity.grid(column=2, row=0, sticky="ew")
+        identity.columnconfigure(1, weight=1)
+        ttk.Label(identity, text="Chinese").grid(column=0, row=0, sticky="w")
+        ttk.Entry(identity, textvariable=self.draft_chinese).grid(column=1, row=0, sticky="ew", padx=8)
+        ttk.Label(identity, text="Pinyin").grid(column=0, row=1, sticky="w", pady=(8, 0))
+        ttk.Entry(identity, textvariable=self.draft_pinyin).grid(column=1, row=1, sticky="ew", padx=8, pady=(8, 0))
+
+        middle = ttk.Frame(container)
+        middle.grid(column=0, row=3, sticky="nsew", pady=(14, 0))
+        middle.columnconfigure(0, weight=1)
+        middle.columnconfigure(1, weight=1)
+        middle.rowconfigure(0, weight=1)
+
+        definition_frame = ttk.LabelFrame(middle, text="Definition selection", padding=8)
+        definition_frame.grid(column=0, row=0, sticky="nsew", padx=(0, 8))
         definition_frame.columnconfigure(0, weight=1)
         definition_frame.rowconfigure(0, weight=1)
         self.dictionary_definition = ttk.Frame(definition_frame)
         self.dictionary_definition.grid(column=0, row=0, sticky="nsew")
 
-        draft = ttk.LabelFrame(container, text="Flashcard draft", padding=10)
-        draft.grid(column=0, row=4, sticky="ew", pady=(14, 0))
-        draft.columnconfigure(1, weight=1)
-        ttk.Label(draft, text="Chinese").grid(column=0, row=0, sticky="w")
-        ttk.Entry(draft, textvariable=self.draft_chinese).grid(column=1, row=0, sticky="ew", padx=8)
-        ttk.Label(draft, text="Pinyin").grid(column=0, row=1, sticky="w", pady=(8, 0))
-        ttk.Entry(draft, textvariable=self.draft_pinyin).grid(column=1, row=1, sticky="ew", padx=8, pady=(8, 0))
-        ttk.Label(draft, text="Meaning").grid(column=0, row=2, sticky="nw", pady=(8, 0))
-        self.draft_meaning = tk.Text(draft, height=3, wrap="word", font=("Segoe UI", 10))
-        self.draft_meaning.grid(column=1, row=2, sticky="ew", padx=8, pady=(8, 0))
-        tag_actions = ttk.Frame(draft)
-        tag_actions.grid(column=1, row=3, sticky="w", padx=8, pady=(8, 0))
-        for tag in ("(adj.)", "(v.)", "(n.)", "(adv.)", "(m.)"):
+        meaning_frame = ttk.LabelFrame(middle, text="Meaning", padding=8)
+        meaning_frame.grid(column=1, row=0, sticky="nsew")
+        meaning_frame.columnconfigure(0, weight=1)
+        meaning_frame.rowconfigure(0, weight=1)
+        self.draft_meaning = tk.Text(meaning_frame, height=8, wrap="word", font=("Segoe UI", 10))
+        self.draft_meaning.grid(column=0, row=0, sticky="nsew")
+        tag_actions = ttk.Frame(meaning_frame)
+        tag_actions.grid(column=0, row=1, sticky="w", pady=(8, 0))
+        for tag in ("(adj.)", "(v.)", "(n.)", "(adv.)", "(m.)", "(pron.)", "(idiom)"):
             ttk.Button(tag_actions, text=tag, command=lambda value=tag: self.add_definition_tag(value)).pack(side="left", padx=(0, 5))
-        ttk.Button(draft, text="Add draft to queue", command=self.add_draft_to_queue).grid(column=1, row=4, sticky="e", pady=(8, 0))
+        ttk.Button(meaning_frame, text="Add draft to queue", command=self.add_draft_to_queue).grid(column=0, row=2, sticky="e", pady=(8, 0))
 
         queue_frame = ttk.LabelFrame(container, text="Dictionary card queue", padding=8)
-        queue_frame.grid(column=0, row=5, sticky="nsew", pady=(14, 0))
+        queue_frame.grid(column=0, row=4, sticky="nsew", pady=(14, 0))
         queue_frame.columnconfigure(0, weight=1)
         queue_frame.rowconfigure(0, weight=1)
         self.dictionary_card_queue = ttk.Treeview(queue_frame, columns=("#", "Chinese", "Pinyin", "English"), show="headings", height=6)
@@ -340,9 +353,11 @@ class ExcelToAnkiApp:
             self.definition_options = []
             for row, definition in enumerate(definitions):
                 selected = tk.BooleanVar(value=False)
+                selected.set(False)
+                shortcut = ("1234567890"[row] + ". ") if row < 10 else "    "
                 ttk.Checkbutton(
                     self.dictionary_definition,
-                    text=definition,
+                    text=f"{shortcut}{definition}",
                     variable=selected,
                     command=lambda meaning=definition, value=selected: self._definition_option_toggled(meaning, value),
                 ).grid(column=0, row=row, sticky="w", pady=(0 if row == 0 else 4, 0))
@@ -357,11 +372,22 @@ class ExcelToAnkiApp:
             return
         current = self.draft_meaning.get("1.0", "end-1c").strip()
         if selected.get():
-            if meaning not in current.split("; "):
-                updated = f"{current}; {meaning}" if current else meaning
+            if current == meaning or current.endswith(f"; {meaning}") or current.endswith(f" {meaning}"):
+                updated = current
+            elif current and current.endswith(("(adj.)", "(v.)", "(n.)", "(adv.)", "(m.)", "(pron.)", "(idiom)")):
+                updated = f"{current} {meaning}"
+            elif current:
+                updated = f"{current}; {meaning}"
+            else:
+                updated = meaning
         else:
-            pieces = [piece for piece in current.split("; ") if piece != meaning]
-            updated = "; ".join(pieces)
+            updated = current
+            for delimiter in (f"; {meaning}", f" {meaning}"):
+                if updated.endswith(delimiter):
+                    updated = updated[: -len(delimiter)].rstrip()
+                    break
+            if updated == meaning:
+                updated = ""
         self.draft_meaning.delete("1.0", tk.END)
         self.draft_meaning.insert("1.0", updated)
 
@@ -404,6 +430,76 @@ class ExcelToAnkiApp:
         updated = f"{current} {tag}" if current else tag
         self.draft_meaning.delete("1.0", tk.END)
         self.draft_meaning.insert("1.0", updated)
+
+    def _handle_make_cards_key(self, event) -> str | None:
+        """Handle tab navigation and Make Cards keyboard shortcuts."""
+        if event.keysym in {"Left", "Right"}:
+            tabs = self.notebook.tabs()
+            current_tab = self.notebook.select()
+            if current_tab in tabs:
+                current_index = tabs.index(current_tab)
+                step = -1 if event.keysym == "Left" else 1
+                next_index = max(0, min(len(tabs) - 1, current_index + step))
+                self.notebook.select(tabs[next_index])
+                return "break"
+
+        if self.notebook.tab(self.notebook.select(), "text") != "Make Cards":
+            return None
+        focused = self.root.focus_get()
+        if focused is not None and focused.winfo_class() in {"Entry", "TEntry", "Text"} and event.keysym not in {"Return", "Up", "Down"}:
+            return None
+
+        number_keys = "1234567890"
+        if event.char in number_keys:
+            index = number_keys.index(event.char)
+            if index < len(self.definition_options):
+                meaning, variable = self.definition_options[index]
+                variable.set(not variable.get())
+                self._definition_option_toggled(meaning, variable)
+                return "break"
+
+        tag_keys = {
+            "n": "(n.)", "v": "(v.)", "m": "(m.)", "a": "(adj.)",
+            "d": "(adv.)", "p": "(pron.)", "i": "(idiom)",
+        }
+        if event.char.lower() in tag_keys and not (focused and focused.winfo_class() in {"Entry", "TEntry", "Text"}):
+            self.add_definition_tag(tag_keys[event.char.lower()])
+            return "break"
+
+        if event.keysym in {"Up", "Down"}:
+            count = len(self.dictionary_entries)
+            if count:
+                selected = self.dictionary_matches.curselection()
+                if selected:
+                    current = selected[0]
+                else:
+                    current = 0 if event.keysym == "Up" else -1
+                next_index = max(0, current - 1) if event.keysym == "Up" else min(count - 1, current + 1)
+                self.dictionary_matches.selection_clear(0, tk.END)
+                self.dictionary_matches.selection_set(next_index)
+                self.dictionary_matches.see(next_index)
+                self._show_selected_dictionary_entry()
+                return "break"
+
+        if event.keysym == "Return" and not (focused and focused.winfo_class() == "Entry"):
+            before = len(self.dictionary_card_queue.get_children())
+            self.add_draft_to_queue()
+            if len(self.dictionary_card_queue.get_children()) > before:
+                self._advance_to_next_word()
+            return "break"
+        return None
+
+    def _advance_to_next_word(self) -> None:
+        selected = self.chosen_words.curselection()
+        current = selected[0] if selected else -1
+        if current < 0 or current >= len(self.word_list) - 1:
+            return
+        next_index = current + 1
+        self.chosen_words.selection_clear(0, tk.END)
+        self.chosen_words.selection_set(next_index)
+        self.chosen_words.see(next_index)
+        self.dictionary_query.set(self.word_list[next_index])
+        self.search_dictionary()
 
     def remove_selected_dictionary_cards(self) -> None:
         selected = self.dictionary_card_queue.selection()
