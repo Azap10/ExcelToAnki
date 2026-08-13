@@ -536,10 +536,71 @@ class ExcelToAnkiApp:
             self.events.put(("dictionary_done", ""))
 
     def _build_pdf_ocr_tab(self, container: ttk.Frame) -> None:
-        # OCR/PDF integration is intentionally paused while new features are
-        # developed. Keep the tab available as a lightweight future home.
-        container.columnconfigure(0, weight=1)
-        container.rowconfigure(2, weight=1)
+        """Build the Choose Words workspace with a PDF viewer and word list."""
+        container.columnconfigure(0, weight=3)
+        container.columnconfigure(1, weight=1)
+        container.rowconfigure(0, weight=1)
+        viewer_frame = ttk.Frame(container)
+        viewer_frame.grid(column=0, row=0, sticky="nsew", padx=(0, 16))
+        viewer_frame.columnconfigure(0, weight=1)
+        viewer_frame.rowconfigure(0, weight=1)
+        self.pdf_viewer = ttk.Frame(viewer_frame, width=620, height=820)
+        self.pdf_viewer.grid(column=0, row=0, sticky="nsew")
+        self.pdf_viewer.grid_propagate(False)
+        self.pdf_viewer.columnconfigure(0, weight=1)
+        self.pdf_viewer.rowconfigure(0, weight=1)
+        self.pdf_canvas = tk.Canvas(self.pdf_viewer, background="#2d2d2d", highlightthickness=0)
+        self.pdf_canvas.grid(column=0, row=0, sticky="nsew")
+        self.pdf_canvas.create_text(300, 300, text="Open a PDF to preview it here", fill="#d7d7d7", font=("Segoe UI", 14))
+        self.pdf_canvas.bind("<Configure>", self._queue_pdf_render)
+        self.pdf_canvas.bind("<ButtonPress-1>", self._begin_pdf_text_selection)
+        self.pdf_canvas.bind("<B1-Motion>", self._draw_pdf_text_selection)
+        self.pdf_canvas.bind("<ButtonRelease-1>", self._finish_pdf_text_selection)
+
+        controls = ttk.Frame(container)
+        controls.grid(column=1, row=0, sticky="nsew")
+        controls.columnconfigure(0, weight=1)
+        ttk.Label(controls, text="Choose words", font=("Segoe UI", 18, "bold")).grid(column=0, row=0, sticky="w")
+        ttk.Label(controls, text="Open a PDF, then drag over selectable text to add it to the word list.", wraplength=320).grid(column=0, row=1, sticky="w", pady=(4, 14))
+        pdf_controls = ttk.LabelFrame(controls, text="PDF", padding=10)
+        pdf_controls.grid(column=0, row=2, sticky="ew")
+        pdf_controls.columnconfigure(0, weight=1)
+        ttk.Button(pdf_controls, text="Open PDF", command=self.choose_pdf).grid(column=0, row=0, sticky="ew")
+        ttk.Label(pdf_controls, textvariable=self.pdf_file_name, wraplength=300).grid(column=0, row=1, sticky="w", pady=(8, 0))
+        ttk.Button(pdf_controls, text="Previous page", command=lambda: self.change_pdf_page(-1)).grid(column=0, row=2, sticky="w", pady=(8, 0))
+        ttk.Button(pdf_controls, text="Next page", command=lambda: self.change_pdf_page(1)).grid(column=0, row=3, sticky="w", pady=(4, 0))
+        ttk.Label(pdf_controls, textvariable=self.pdf_page_label).grid(column=0, row=4, sticky="w", pady=(6, 0))
+
+        word_input = ttk.LabelFrame(controls, text="Add a word", padding=10)
+        word_input.grid(column=0, row=3, sticky="ew", pady=(14, 0))
+        word_input.columnconfigure(0, weight=1)
+        self.word_entry = ttk.Entry(word_input)
+        self.word_entry.grid(column=0, row=0, sticky="ew")
+        self.word_entry.bind("<Return>", self.add_word_to_list)
+        ttk.Button(word_input, text="Add word", command=self.add_word_to_list).grid(column=1, row=0, padx=(8, 0))
+        self.word_choices_frame = ttk.LabelFrame(controls, text="Word list", padding=8)
+        self.word_choices_frame.grid(column=0, row=4, sticky="nsew", pady=(14, 0))
+        controls.rowconfigure(4, weight=1)
+        self.word_choices_frame.grid_propagate(False)
+        self.word_choices_frame.configure(height=280)
+        self.word_choices_frame.columnconfigure(0, weight=1)
+        self.word_choices_frame.rowconfigure(0, weight=1)
+        self.word_choices_canvas = tk.Canvas(self.word_choices_frame, height=250, highlightthickness=0)
+        self.word_choices_canvas.grid(column=0, row=0, sticky="nsew")
+        word_choices_scrollbar = ttk.Scrollbar(self.word_choices_frame, orient="vertical", command=self.word_choices_canvas.yview)
+        word_choices_scrollbar.grid(column=1, row=0, sticky="ns")
+        self.word_choices_canvas.configure(yscrollcommand=word_choices_scrollbar.set)
+        self.word_choices_inner = ttk.Frame(self.word_choices_canvas)
+        self.word_choices_window = self.word_choices_canvas.create_window((0, 0), window=self.word_choices_inner, anchor="nw")
+        self.word_choices_inner.bind("<Configure>", lambda _event: self.word_choices_canvas.configure(scrollregion=self.word_choices_canvas.bbox("all")))
+        self.word_choices_canvas.bind("<Configure>", lambda event: self.word_choices_canvas.itemconfigure(self.word_choices_window, width=event.width))
+        word_actions = ttk.Frame(controls)
+        word_actions.grid(column=0, row=5, sticky="ew", pady=(8, 0))
+        ttk.Button(word_actions, text="Remove checked words", command=self.remove_checked_words).pack(side="left")
+        ttk.Button(word_actions, text="Remove all words", command=self.remove_all_words).pack(side="left", padx=(8, 0))
+        return
+
+        # Legacy OCR controls remain below for later reactivation.
         ttk.Label(container, text="Choose words", font=("Segoe UI", 18, "bold")).grid(column=0, row=0, sticky="w")
         ttk.Label(
             container,
@@ -694,7 +755,9 @@ class ExcelToAnkiApp:
         if not selected:
             return
         try:
-            document = open_pdf(selected)
+            import pymupdf
+
+            document = pymupdf.open(selected)
         except Exception as error:
             messagebox.showerror("Could not open PDF", str(error))
             return
@@ -705,9 +768,6 @@ class ExcelToAnkiApp:
         self.pdf_page_index = 0
         self.pdf_file_name.set(Path(selected).name)
         self.ocr_summary.set("Ready to recognize the current page.")
-        self._reset_pending_entry()
-        self.recognize_page_button.configure(state="normal")
-        self.create_entry_button.configure(state="normal")
         self._show_pdf_page()
         self.status.set(f"Opened {Path(selected).name}: {document.page_count} page(s).")
 
@@ -718,7 +778,6 @@ class ExcelToAnkiApp:
         if 0 <= target_page < self.pdf_document.page_count:
             self.pdf_page_index = target_page
             self.ocr_summary.set("Ready to recognize the current page.")
-            self._reset_pending_entry()
             self._show_pdf_page()
 
     def _queue_pdf_render(self, _event=None) -> None:
@@ -733,7 +792,8 @@ class ExcelToAnkiApp:
         if self.pdf_document is None or self.pdf_canvas.winfo_width() <= 1:
             return
         try:
-            # import pymupdf  # Temporarily disabled on the fast-build branch.
+            import pymupdf
+            from PIL import Image
 
             page = self.pdf_document.load_page(self.pdf_page_index)
             self._size_pdf_viewer(page)
@@ -763,9 +823,51 @@ class ExcelToAnkiApp:
         self.pdf_canvas.create_image(x_offset, y_offset, anchor="nw", image=self.pdf_image)
         self.pdf_display_bounds = (x_offset, y_offset, self.pdf_image.width(), self.pdf_image.height())
         self.pdf_page_label.set(f"Page {self.pdf_page_index + 1} of {self.pdf_document.page_count}")
-        self.previous_pdf_button.configure(state="normal" if self.pdf_page_index > 0 else "disabled")
+        if hasattr(self, "previous_pdf_button"):
+            self.previous_pdf_button.configure(state="normal" if self.pdf_page_index > 0 else "disabled")
         is_last_page = self.pdf_page_index >= self.pdf_document.page_count - 1
-        self.next_pdf_button.configure(state="disabled" if is_last_page else "normal")
+        if hasattr(self, "next_pdf_button"):
+            self.next_pdf_button.configure(state="disabled" if is_last_page else "normal")
+
+    def _begin_pdf_text_selection(self, event) -> None:
+        self.pdf_text_selection_start = (event.x, event.y)
+        self.pdf_canvas.delete("pdf_text_selection")
+
+    def _draw_pdf_text_selection(self, event) -> None:
+        start = getattr(self, "pdf_text_selection_start", None)
+        if start is None:
+            return
+        self.pdf_canvas.delete("pdf_text_selection")
+        self.pdf_canvas.create_rectangle(*start, event.x, event.y, outline="#35a7ff", width=2, tags="pdf_text_selection")
+
+    def _finish_pdf_text_selection(self, event) -> None:
+        start = getattr(self, "pdf_text_selection_start", None)
+        self.pdf_text_selection_start = None
+        if start is None or self.pdf_document is None or not self.pdf_display_bounds:
+            return
+        x0, y0, width, height = self.pdf_display_bounds
+        left, right = sorted((max(x0, min(event.x, x0 + width)), max(x0, min(start[0], x0 + width))))
+        top, bottom = sorted((max(y0, min(event.y, y0 + height)), max(y0, min(start[1], y0 + height))))
+        if right - left < 4 or bottom - top < 4:
+            return
+        try:
+            import pymupdf
+
+            page = self.pdf_document.load_page(self.pdf_page_index)
+            scale_x = page.rect.width / width
+            scale_y = page.rect.height / height
+            clip = pymupdf.Rect((left - x0) * scale_x, (top - y0) * scale_y, (right - x0) * scale_x, (bottom - y0) * scale_y)
+            text = " ".join(page.get_text("text", clip=clip).split())
+            if text:
+                self.word_entry.delete(0, tk.END)
+                self.word_entry.insert(0, text)
+                self.add_word_to_list()
+            else:
+                self.status.set("No selectable PDF text found in that region.")
+        except Exception as error:
+            messagebox.showerror("Could not select PDF text", str(error))
+        finally:
+            self.pdf_canvas.delete("pdf_text_selection")
 
     def _size_pdf_viewer(self, page) -> None:
         """Keep the preview sized to the page, leaving workspace for OCR tools."""
