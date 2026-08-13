@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Any
 
 
+RENDER_DPI = 150
+TEXT_DETECTION_MODEL = "PP-OCRv5_mobile_det"
+TEXT_RECOGNITION_MODEL = "PP-OCRv5_mobile_rec"
+
+
 @dataclass(frozen=True)
 class OcrSpan:
     """One recognized text region, with coordinates in image pixels and PDF points."""
@@ -101,6 +106,8 @@ def create_ocr_engine() -> Any:
     # reliable source for this Windows desktop workflow; callers can override
     # it by setting PADDLE_PDX_MODEL_SOURCE before launching the app.
     os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "BOS")
+    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+    os.environ.setdefault("FLAGS_use_mkldnn", "0")
     try:
         from paddleocr import PaddleOCR
     except ImportError as error:
@@ -110,13 +117,16 @@ def create_ocr_engine() -> Any:
 
     try:
         return PaddleOCR(
-            lang="ch",
+            device="cpu",
+            enable_mkldnn=False,
+            text_detection_model_name=TEXT_DETECTION_MODEL,
+            text_recognition_model_name=TEXT_RECOGNITION_MODEL,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
         )
     except TypeError:
-        return PaddleOCR(lang="ch", use_angle_cls=True)
+        return PaddleOCR(lang="ch", use_angle_cls=True, use_mkldnn=False)
 
 
 def render_pdf_page(document: Any, page_index: int, dpi: int = 225) -> RenderedPage:

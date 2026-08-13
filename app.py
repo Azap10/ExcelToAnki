@@ -12,9 +12,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from ankiHelpers import add_three_sided_card, list_decks
 from dictionaryHelpers import DictionaryEntry, definition_parts, lookup, pinyin_with_tone_marks
-# OCR/PDF integration is temporarily disabled on this fast-build branch.
-# from ocrHelpers import create_ocr_engine, open_pdf, process_pdf_page, process_pdf_region
-# from PIL import Image
+from ocrHelpers import RENDER_DPI, create_ocr_engine, open_pdf, process_pdf_region
 
 REQUIRED_COLUMNS = ("Chinese", "Pinyin", "English", "Lesson", "Character")
 PDF_RENDER_OVERSAMPLE = 2
@@ -36,10 +34,13 @@ class ExcelToAnkiApp:
         self.pdf_document = None
         self.pdf_path: Path | None = None
         self.pdf_page_index = 0
+        self.pdf_zoom = 1.0
         self.pdf_image = None
         self.pdf_display_bounds: tuple[int, int, int, int] | None = None
         self.pdf_render_job = None
         self.ocr_engine = None
+        self.ocr_engine_error: Exception | None = None
+        self.ocr_engine_ready = threading.Event()
         self.entry_selection_active = False
         self.selection_start: tuple[int, int] | None = None
         self.selection_rectangle = None
@@ -57,6 +58,7 @@ class ExcelToAnkiApp:
         self.pdf_file_name = tk.StringVar(value="No PDF selected")
         self.pdf_page_label = tk.StringVar(value="Page - of -")
         self.ocr_summary = tk.StringVar(value="Open a PDF, then recognize the current page.")
+        self.ocr_engine_status = tk.StringVar(value="Preparing OCR engine...")
         self.entry_summary = tk.StringVar(value="Select Create Entry, then draw a box around text on the page.")
         self.dictionary_query = tk.StringVar()
         self.word_list: list[str] = []
@@ -551,6 +553,11 @@ class ExcelToAnkiApp:
         self.pdf_viewer.rowconfigure(0, weight=1)
         self.pdf_canvas = tk.Canvas(self.pdf_viewer, background="#2d2d2d", highlightthickness=0)
         self.pdf_canvas.grid(column=0, row=0, sticky="nsew")
+        pdf_vertical_scrollbar = ttk.Scrollbar(self.pdf_viewer, orient="vertical", command=self.pdf_canvas.yview)
+        pdf_vertical_scrollbar.grid(column=1, row=0, sticky="ns")
+        pdf_horizontal_scrollbar = ttk.Scrollbar(self.pdf_viewer, orient="horizontal", command=self.pdf_canvas.xview)
+        pdf_horizontal_scrollbar.grid(column=0, row=1, sticky="ew")
+        self.pdf_canvas.configure(xscrollcommand=pdf_horizontal_scrollbar.set, yscrollcommand=pdf_vertical_scrollbar.set)
         self.pdf_canvas.create_text(300, 300, text="Open a PDF to preview it here", fill="#d7d7d7", font=("Segoe UI", 14))
         self.pdf_canvas.bind("<Configure>", self._queue_pdf_render)
         self.pdf_canvas.bind("<ButtonPress-1>", self._begin_pdf_text_selection)
@@ -570,6 +577,12 @@ class ExcelToAnkiApp:
         ttk.Button(pdf_controls, text="Previous page", command=lambda: self.change_pdf_page(-1)).grid(column=0, row=2, sticky="w", pady=(8, 0))
         ttk.Button(pdf_controls, text="Next page", command=lambda: self.change_pdf_page(1)).grid(column=0, row=3, sticky="w", pady=(4, 0))
         ttk.Label(pdf_controls, textvariable=self.pdf_page_label).grid(column=0, row=4, sticky="w", pady=(6, 0))
+        zoom_actions = ttk.Frame(pdf_controls)
+        zoom_actions.grid(column=0, row=5, sticky="w", pady=(8, 0))
+        ttk.Button(zoom_actions, text="Zoom out", command=lambda: self.adjust_pdf_zoom(-0.25)).pack(side="left")
+        ttk.Button(zoom_actions, text="Reset", command=lambda: self.set_pdf_zoom(1.0)).pack(side="left", padx=5)
+        ttk.Button(zoom_actions, text="Zoom in", command=lambda: self.adjust_pdf_zoom(0.25)).pack(side="left")
+        ttk.Label(pdf_controls, textvariable=self.ocr_engine_status, wraplength=300, foreground="#555555").grid(column=0, row=6, sticky="w", pady=(8, 0))
 
         word_input = ttk.LabelFrame(controls, text="Add a word", padding=10)
         word_input.grid(column=0, row=3, sticky="ew", pady=(14, 0))
@@ -598,6 +611,7 @@ class ExcelToAnkiApp:
         word_actions.grid(column=0, row=5, sticky="ew", pady=(8, 0))
         ttk.Button(word_actions, text="Remove checked words", command=self.remove_checked_words).pack(side="left")
         ttk.Button(word_actions, text="Remove all words", command=self.remove_all_words).pack(side="left", padx=(8, 0))
+        threading.Thread(target=self._warm_up_ocr_engine, daemon=True).start()
         return
 
         # Legacy OCR controls remain below for later reactivation.
@@ -780,6 +794,16 @@ class ExcelToAnkiApp:
             self.ocr_summary.set("Ready to recognize the current page.")
             self._show_pdf_page()
 
+    def set_pdf_zoom(self, zoom: float) -> None:
+        """Set PDF preview magnification and rerender the current page."""
+        self.pdf_zoom = max(0.75, min(2.5, zoom))
+        if self.pdf_document is not None:
+            self._show_pdf_page()
+        self.status.set(f"PDF zoom: {round(self.pdf_zoom * 100)}%.")
+
+    def adjust_pdf_zoom(self, delta: float) -> None:
+        self.set_pdf_zoom(self.pdf_zoom + delta)
+
     def _queue_pdf_render(self, _event=None) -> None:
         if self.pdf_document is None:
             return
@@ -800,7 +824,7 @@ class ExcelToAnkiApp:
             self.root.update_idletasks()
             available_width = max(self.pdf_canvas.winfo_width() - PDF_VIEWER_PADDING * 2, 100)
             available_height = max(self.pdf_canvas.winfo_height() - PDF_VIEWER_PADDING * 2, 100)
-            scale = min(available_width / page.rect.width, available_height / page.rect.height)
+            scale = min(available_width / page.rect.width, available_height / page.rect.height) * self.pdf_zoom
             render_scale = scale * PDF_RENDER_OVERSAMPLE
             pixmap = page.get_pixmap(matrix=pymupdf.Matrix(render_scale, render_scale), alpha=False)
             rendered_image = Image.open(BytesIO(pixmap.tobytes("png")))
@@ -821,6 +845,7 @@ class ExcelToAnkiApp:
         x_offset = max((self.pdf_canvas.winfo_width() - self.pdf_image.width()) // 2, 0)
         y_offset = max((self.pdf_canvas.winfo_height() - self.pdf_image.height()) // 2, 0)
         self.pdf_canvas.create_image(x_offset, y_offset, anchor="nw", image=self.pdf_image)
+        self.pdf_canvas.configure(scrollregion=(0, 0, max(self.pdf_canvas.winfo_width(), x_offset + self.pdf_image.width()), max(self.pdf_canvas.winfo_height(), y_offset + self.pdf_image.height())))
         self.pdf_display_bounds = (x_offset, y_offset, self.pdf_image.width(), self.pdf_image.height())
         self.pdf_page_label.set(f"Page {self.pdf_page_index + 1} of {self.pdf_document.page_count}")
         if hasattr(self, "previous_pdf_button"):
@@ -858,16 +883,58 @@ class ExcelToAnkiApp:
             scale_y = page.rect.height / height
             clip = pymupdf.Rect((left - x0) * scale_x, (top - y0) * scale_y, (right - x0) * scale_x, (bottom - y0) * scale_y)
             text = " ".join(page.get_text("text", clip=clip).split())
-            if text:
-                self.word_entry.delete(0, tk.END)
-                self.word_entry.insert(0, text)
-                self.add_word_to_list()
-            else:
-                self.status.set("No selectable PDF text found in that region.")
+            self._populate_word_from_selection(text, clip)
         except Exception as error:
             messagebox.showerror("Could not select PDF text", str(error))
         finally:
             self.pdf_canvas.delete("pdf_text_selection")
+
+    def _warm_up_ocr_engine(self) -> None:
+        """Prepare the compact CPU OCR engine while the user works manually."""
+        try:
+            self.events.put(("ocr_engine_status", "Loading compact PaddleOCR models..."))
+            self.ocr_engine = create_ocr_engine()
+            self.events.put(("ocr_engine_status", "OCR ready (CPU, PP-OCRv5 mobile)."))
+        except Exception as error:
+            self.ocr_engine_error = error
+            self.events.put(("ocr_engine_error", str(error)))
+        finally:
+            self.ocr_engine_ready.set()
+
+    def _populate_word_from_selection(self, text: str, pdf_rect) -> None:
+        """Use embedded PDF text immediately, or OCR the region when needed."""
+        if text:
+            self.word_entry.delete(0, tk.END)
+            self.word_entry.insert(0, text)
+            self.add_word_to_list()
+            return
+        if self.pdf_path is None:
+            self.status.set("No PDF is open and no text was found in that region.")
+            return
+        self.status.set("Recognizing the selected region with PaddleOCR...")
+        threading.Thread(
+            target=self._ocr_selected_region_worker,
+            args=(self.pdf_path, self.pdf_page_index, tuple(pdf_rect)),
+            daemon=True,
+        ).start()
+
+    def _ocr_selected_region_worker(self, pdf_path: Path, page_index: int, pdf_rect: tuple[float, float, float, float]) -> None:
+        document = None
+        try:
+            self.ocr_engine_ready.wait()
+            if self.ocr_engine_error is not None:
+                raise self.ocr_engine_error
+            if self.ocr_engine is None:
+                raise RuntimeError("The OCR engine did not finish initializing.")
+            document = open_pdf(pdf_path)
+            result = process_pdf_region(document, page_index, self.ocr_engine, pdf_rect, dpi=RENDER_DPI)
+            text = " ".join(span.text for span in result.spans).strip()
+            self.events.put(("ocr_selection_result", text))
+        except Exception as error:
+            self.events.put(("ocr_selection_error", str(error)))
+        finally:
+            if document is not None:
+                document.close()
 
     def _size_pdf_viewer(self, page) -> None:
         """Keep the preview sized to the page, leaving workspace for OCR tools."""
@@ -1276,6 +1343,23 @@ class ExcelToAnkiApp:
                         self.dictionary_card_queue.delete(item)
                 elif event == "dictionary_done":
                     self.add_button.configure(state="normal")
+                elif event == "ocr_selection_result":
+                    text = str(message).strip()
+                    if text:
+                        self.word_entry.delete(0, tk.END)
+                        self.word_entry.insert(0, text)
+                        self.add_word_to_list()
+                    else:
+                        self.status.set("PaddleOCR found no text in that region.")
+                elif event == "ocr_selection_error":
+                    self.status.set("OCR could not recognize the selected region.")
+                    messagebox.showerror("Could not recognize selected text", message)
+                elif event == "ocr_engine_status":
+                    self.ocr_engine_status.set(message)
+                elif event == "ocr_engine_error":
+                    self.ocr_engine_status.set("OCR unavailable: engine failed to load.")
+                    self.status.set("OCR could not be initialized; embedded PDF text remains available.")
+                    messagebox.showerror("Could not load OCR", message)
                 elif event == "ocr_result":
                     self._display_ocr_result(message)
                 elif event == "ocr_error":
