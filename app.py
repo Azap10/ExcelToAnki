@@ -57,6 +57,7 @@ class ExcelToAnkiApp:
         self.deck_name = tk.StringVar()
         self.pdf_file_name = tk.StringVar(value="No PDF selected")
         self.pdf_page_label = tk.StringVar(value="Page - of -")
+        self.pdf_page_number = tk.StringVar(value="")
         self.ocr_summary = tk.StringVar(value="Open a PDF, then recognize the current page.")
         self.ocr_engine_status = tk.StringVar(value="Preparing OCR engine...")
         self.entry_summary = tk.StringVar(value="Select Create Entry, then draw a box around text on the page.")
@@ -574,15 +575,32 @@ class ExcelToAnkiApp:
         pdf_controls.columnconfigure(0, weight=1)
         ttk.Button(pdf_controls, text="Open PDF", command=self.choose_pdf).grid(column=0, row=0, sticky="ew")
         ttk.Label(pdf_controls, textvariable=self.pdf_file_name, wraplength=300).grid(column=0, row=1, sticky="w", pady=(8, 0))
-        ttk.Button(pdf_controls, text="Previous page", command=lambda: self.change_pdf_page(-1)).grid(column=0, row=2, sticky="w", pady=(8, 0))
-        ttk.Button(pdf_controls, text="Next page", command=lambda: self.change_pdf_page(1)).grid(column=0, row=3, sticky="w", pady=(4, 0))
+        page_actions = ttk.Frame(pdf_controls)
+        page_actions.grid(column=0, row=2, sticky="w", pady=(8, 0))
+        ttk.Button(page_actions, text="Previous page", command=lambda: self.change_pdf_page(-1)).pack(side="left")
+        ttk.Button(page_actions, text="Next page", command=lambda: self.change_pdf_page(1)).pack(side="left", padx=(6, 0))
         ttk.Label(pdf_controls, textvariable=self.pdf_page_label).grid(column=0, row=4, sticky="w", pady=(6, 0))
+        page_selector = ttk.Frame(pdf_controls)
+        page_selector.grid(column=0, row=5, sticky="w", pady=(8, 0))
+        ttk.Label(page_selector, text="Page number").pack(side="left")
+        self.pdf_page_spinbox = ttk.Spinbox(
+            page_selector,
+            from_=1,
+            to=1,
+            width=7,
+            textvariable=self.pdf_page_number,
+            state="disabled",
+            command=self.go_to_pdf_page,
+        )
+        self.pdf_page_spinbox.pack(side="left", padx=(6, 6))
+        self.pdf_page_spinbox.bind("<Return>", self.go_to_pdf_page)
+        ttk.Button(page_selector, text="Go", command=self.go_to_pdf_page).pack(side="left")
         zoom_actions = ttk.Frame(pdf_controls)
-        zoom_actions.grid(column=0, row=5, sticky="w", pady=(8, 0))
+        zoom_actions.grid(column=0, row=6, sticky="w", pady=(8, 0))
         ttk.Button(zoom_actions, text="Zoom out", command=lambda: self.adjust_pdf_zoom(-0.25)).pack(side="left")
         ttk.Button(zoom_actions, text="Reset", command=lambda: self.set_pdf_zoom(1.0)).pack(side="left", padx=5)
         ttk.Button(zoom_actions, text="Zoom in", command=lambda: self.adjust_pdf_zoom(0.25)).pack(side="left")
-        ttk.Label(pdf_controls, textvariable=self.ocr_engine_status, wraplength=300, foreground="#555555").grid(column=0, row=6, sticky="w", pady=(8, 0))
+        ttk.Label(pdf_controls, textvariable=self.ocr_engine_status, wraplength=300, foreground="#555555").grid(column=0, row=7, sticky="w", pady=(8, 0))
 
         word_input = ttk.LabelFrame(controls, text="Add a word", padding=10)
         word_input.grid(column=0, row=3, sticky="ew", pady=(14, 0))
@@ -781,6 +799,8 @@ class ExcelToAnkiApp:
         self.pdf_path = Path(selected)
         self.pdf_page_index = 0
         self.pdf_file_name.set(Path(selected).name)
+        self.pdf_page_spinbox.configure(from_=1, to=max(1, document.page_count), state="normal")
+        self.pdf_page_number.set("1")
         self.ocr_summary.set("Ready to recognize the current page.")
         self._show_pdf_page()
         self.status.set(f"Opened {Path(selected).name}: {document.page_count} page(s).")
@@ -793,6 +813,28 @@ class ExcelToAnkiApp:
             self.pdf_page_index = target_page
             self.ocr_summary.set("Ready to recognize the current page.")
             self._show_pdf_page()
+
+    def go_to_pdf_page(self, _event=None) -> str:
+        """Show the one-based PDF page entered in the page selector."""
+        if self.pdf_document is None:
+            return "break"
+        try:
+            page_number = int(self.pdf_page_number.get())
+        except ValueError:
+            messagebox.showinfo("Choose a page", "Enter a whole-number PDF page.")
+            self.pdf_page_number.set(str(self.pdf_page_index + 1))
+            return "break"
+        if not 1 <= page_number <= self.pdf_document.page_count:
+            messagebox.showinfo(
+                "Choose a page",
+                f"Enter a page number from 1 to {self.pdf_document.page_count}.",
+            )
+            self.pdf_page_number.set(str(self.pdf_page_index + 1))
+            return "break"
+        self.pdf_page_index = page_number - 1
+        self.ocr_summary.set("Ready to recognize the current page.")
+        self._show_pdf_page()
+        return "break"
 
     def set_pdf_zoom(self, zoom: float) -> None:
         """Set PDF preview magnification and rerender the current page."""
@@ -848,6 +890,7 @@ class ExcelToAnkiApp:
         self.pdf_canvas.configure(scrollregion=(0, 0, max(self.pdf_canvas.winfo_width(), x_offset + self.pdf_image.width()), max(self.pdf_canvas.winfo_height(), y_offset + self.pdf_image.height())))
         self.pdf_display_bounds = (x_offset, y_offset, self.pdf_image.width(), self.pdf_image.height())
         self.pdf_page_label.set(f"Page {self.pdf_page_index + 1} of {self.pdf_document.page_count}")
+        self.pdf_page_number.set(str(self.pdf_page_index + 1))
         if hasattr(self, "previous_pdf_button"):
             self.previous_pdf_button.configure(state="normal" if self.pdf_page_index > 0 else "disabled")
         is_last_page = self.pdf_page_index >= self.pdf_document.page_count - 1
